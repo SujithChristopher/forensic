@@ -16,6 +16,7 @@ def read_temp_raw(device_file):
 
 def read_temp(device_file):
     lines = read_temp_raw(device_file)
+
     while lines[0].strip()[-3:] != 'YES':
         time.sleep(1)
         lines = read_temp_raw(device_file)
