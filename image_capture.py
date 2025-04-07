@@ -6,30 +6,35 @@ import platform
 import csv
 from datetime import datetime
 
-class DataRecorder():
+
+class DataRecorder:
     def __init__(self):
         self.frame_size = (1280, 720)
-        
+
         # Create base data directory
         self.data_dir = "data"
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
-        
+
         # Initialize camera based on platform
         if platform.system() == "Linux":
             self._init_rpi_camera()
         else:
             self._init_camera()
-            
+
+        # Number of temperature sensors to use
+        self.num_sensors = 4
+
         # Initialize day-specific paths
         self._update_day_paths()
-        
+
         # Last image capture timestamp
         self.last_image_time = 0
-   
+
     def _init_rpi_camera(self):
         from picamera2 import Picamera2
         import libcamera
+
         self.picam2 = Picamera2()
         config = self.picam2.create_video_configuration(
             {"format": "YUV420", "size": self.frame_size},
@@ -38,78 +43,104 @@ class DataRecorder():
         )
         self.picam2.configure(config)
         self.picam2.start()
-       
+
     def _init_camera(self):
         self.camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
-        
+
     def _update_day_paths(self):
         """Update paths for the current day"""
         current_date = datetime.now().strftime("%Y-%m-%d")
         self.day_str = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
-        
+
         # Create day directory for images
         self.day_dir = os.path.join(self.data_dir, self.day_str)
         if not os.path.exists(self.day_dir):
             os.makedirs(self.day_dir)
-            
+
         # Set up CSV file for temperature data
         self.csv_filename = os.path.join(self.day_dir, f"temp_data_{current_date}.csv")
-        
+
         # Create CSV with headers if it doesn't exist
         if not os.path.exists(self.csv_filename):
-            with open(self.csv_filename, 'w', newline='') as f:
+            with open(self.csv_filename, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow(['timestamp', 'sensor_id', 'temp_c', 'temp_f'])
-    
+                # Create header with timestamp and sensor1 through sensor4
+                header = ["timestamp"] + [
+                    f"sensor{i+1}" for i in range(self.num_sensors)
+                ]
+                writer.writerow(header)
+
     def initialize_sensors(self):
         if platform.system() == "Linux":
-            os.system('modprobe w1-gpio')
-            os.system('modprobe w1-therm')
-            base_dir = '/sys/bus/w1/devices/'
-            device_folders = glob.glob(base_dir + '28*')  # Get all DS18B20 device folders
+            os.system("modprobe w1-gpio")
+            os.system("modprobe w1-therm")
+            base_dir = "/sys/bus/w1/devices/"
+            device_folders = glob.glob(
+                base_dir + "28*"
+            )  # Get all DS18B20 device folders
             print(f"Found {len(device_folders)} temperature sensors")
-            return [folder + '/w1_slave' for folder in device_folders]
+            sensor_files = [folder + "/w1_slave" for folder in device_folders]
+
+            # If we found fewer than 4 sensors, pad with None values
+            sensor_files = sensor_files[
+                : self.num_sensors
+            ]  # Limit to maximum 4 sensors
+            while len(sensor_files) < self.num_sensors:
+                sensor_files.append(None)
+            return sensor_files
         else:
             print("Running on non-Linux platform. Using simulated temperature sensors.")
-            # Return dummy sensor IDs for testing on non-Linux platforms
-            return ["dummy_sensor_1", "dummy_sensor_2"]
-            
+            # Return 4 dummy sensor values for testing
+            return [
+                "dummy_sensor_1",
+                "dummy_sensor_2",
+                "dummy_sensor_3",
+                "dummy_sensor_4",
+            ]
+
     def read_temp_raw(self, device_file):
-        if platform.system() == "Linux":
-            with open(device_file, 'r') as f:
+        if platform.system() == "Linux" and device_file is not None:
+            with open(device_file, "r") as f:
                 return f.readlines()
         else:
-            # Simulate sensor reading on non-Linux platforms
+            # Simulate sensor reading on non-Linux platforms or when sensor is missing
             return ["YES", "t=23456"]
-            
+
     def read_temp(self, device_file):
-        if platform.system() == "Linux":
+        if platform.system() == "Linux" and device_file is not None:
             lines = self.read_temp_raw(device_file)
-            while lines[0].strip()[-3:] != 'YES':
+            while lines[0].strip()[-3:] != "YES":
                 time.sleep(0.2)
                 lines = self.read_temp_raw(device_file)
-            
-            equals_pos = lines[1].find('t=')
+
+            equals_pos = lines[1].find("t=")
             if equals_pos != -1:
-                temp_string = lines[1][equals_pos+2:]
+                temp_string = lines[1][equals_pos + 2 :]
                 temp_c = float(temp_string) / 1000.0
-                temp_f = temp_c * 9.0 / 5.0 + 32.0
-                return temp_c, temp_f
+                return temp_c
+            return None
         else:
             # Generate simulated temperature readings
             import random
-            temp_c = 20 + random.uniform(-2, 2)
-            temp_f = temp_c * 9.0 / 5.0 + 32.0
-            return temp_c, temp_f
-    
+
+            # Each sensor gets a slightly different base temperature for more realistic simulation
+            sensor_id = 0
+            if isinstance(device_file, str) and device_file.startswith("dummy_sensor_"):
+                try:
+                    sensor_id = int(device_file.split("_")[-1]) - 1
+                except:
+                    pass
+            temp_c = 20 + sensor_id + random.uniform(-1, 1)
+            return temp_c
+
     def capture_image(self):
         """Capture and save an image with timestamp"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         image_path = os.path.join(self.day_dir, f"image_{timestamp}.jpg")
-        
+
         if platform.system() == "Linux":
             # Capture with Raspberry Pi camera
             img = self.picam2.capture_array()
@@ -119,26 +150,34 @@ class DataRecorder():
             ret, frame = self.camera.read()
             if ret:
                 cv2.imwrite(image_path, frame)
-                
+
         print(f"Image saved: {image_path}")
-    
-    def log_temperature(self, sensor_id, temp_c, temp_f):
+
+    def log_temperature(self, temperatures):
         """Log temperature data to the CSV file"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        with open(self.csv_filename, 'a', newline='') as f:
+
+        # Convert None values to empty strings
+        temp_values = [
+            f"{temp:.2f}" if temp is not None else "" for temp in temperatures
+        ]
+
+        with open(self.csv_filename, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, sensor_id, f"{temp_c:.2f}", f"{temp_f:.2f}"])
-    
+            writer.writerow([timestamp] + temp_values)
+
     def main(self):
         sensor_files = self.initialize_sensors()
-        if not sensor_files:
+        if not any(sensor_files):
             print("No temperature sensors detected.")
             return
-        
-        print(f"Starting data recording. Images saved every minute, temperature recorded every second.")
+
+        print(
+            f"Starting data recording. Images saved every minute, temperature recorded every second."
+        )
         print(f"Data directory: {self.data_dir}")
-        
+        print(f"Using {self.num_sensors} temperature sensors")
+
         try:
             while True:
                 # Check if we need to update day directory
@@ -146,27 +185,31 @@ class DataRecorder():
                 if current_day != self.day_str:
                     self._update_day_paths()
                     print(f"New day detected. Saving to {self.day_dir}")
-                
+
                 # Record temperature for all sensors
+                temperatures = []
                 for i, sensor in enumerate(sensor_files):
-                    sensor_id = sensor.split('/')[-2] if platform.system() == "Linux" else f"sensor_{i+1}"
-                    temp_c, temp_f = self.read_temp(sensor)
-                    print(f"Sensor {sensor_id}: {temp_c:.2f}°C / {temp_f:.2f}°F")
-                    self.log_temperature(sensor_id, temp_c, temp_f)
-                
+                    temp_c = self.read_temp(sensor)
+                    temperatures.append(temp_c)
+                    print(f"Sensor {i+1}: {temp_c:.2f}°C")
+
+                # Log all temperatures in one row
+                self.log_temperature(temperatures)
+
                 # Capture image once per minute
                 current_time = time.time()
-                if current_time - self.last_image_time >= 3:  # 60 seconds = 1 minute
+                if current_time - self.last_image_time >= 60:  # 60 seconds = 1 minute
                     self.capture_image()
                     self.last_image_time = current_time
-                
+
                 print("---")
                 time.sleep(1)  # 1 second interval
-                
+
         except KeyboardInterrupt:
             print("Recording stopped by user")
             if platform.system() != "Linux":
                 self.camera.release()
+
 
 if __name__ == "__main__":
     DataRecorder().main()
