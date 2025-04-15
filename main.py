@@ -8,9 +8,12 @@ import platform
 class DataRecorder:
     def __init__(self):
         if platform.system() == "Linux":
+            self.frame_size = (1280, 720)
             self._init_rpi_camera()
         else:
             self._init_camera()
+
+
 
     def _init_rpi_camera(self):
         from picamera2 import Picamera2
@@ -39,18 +42,18 @@ class DataRecorder:
         print(device_folders)
         return [folder + "/w1_slave" for folder in device_folders]
 
-    def read_temp_raw(device_file):
-        with open(device_file, "r") as f:
+    def read_temp_raw(self, device_file):
+        with open(device_file, 'r') as f:
             return f.readlines()
 
     def read_temp(self, device_file):
-        lines = read_temp_raw(device_file)
+        lines = self.read_temp_raw(device_file)
 
         while lines[0].strip()[-3:] != "YES":
             time.sleep(1)
-            lines = read_temp_raw(device_file)
-
-        equals_pos = lines[1].find("t=")
+            lines = self.read_temp_raw(device_file)
+        
+        equals_pos = lines[1].find('t=')
         if equals_pos != -1:
             temp_string = lines[1][equals_pos + 2 :]
             temp_c = float(temp_string) / 1000.0
