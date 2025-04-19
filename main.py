@@ -8,7 +8,7 @@ from datetime import datetime
 
 class DataRecorder():
     def __init__(self, use_led=True):
-        self.frame_size = (1280, 720)
+        self.frame_size = (4608, 2592)
         
         # Flag to control LED usage during image capture
         self.use_led = use_led
@@ -54,7 +54,7 @@ class DataRecorder():
         """Turn LED on"""
         if platform.system() == "Linux" and self.use_led and hasattr(self, 'led_line'):
             try:
-                self.led_line.set_value(1)
+                self.led_line.set_value(0)
                 print("LED turned ON")
             except Exception as e:
                 print(f"Error turning LED on: {e}")
@@ -63,7 +63,7 @@ class DataRecorder():
         """Turn LED off"""
         if platform.system() == "Linux" and self.use_led and hasattr(self, 'led_line'):
             try:
-                self.led_line.set_value(0)
+                self.led_line.set_value(1)
                 print("LED turned OFF")
             except Exception as e:
                 print(f"Error turning LED off: {e}")
@@ -73,12 +73,12 @@ class DataRecorder():
             from picamera2 import Picamera2
             import libcamera
             self.picam2 = Picamera2()
-            config = self.picam2.create_video_configuration(
-                {"format": "YUV420", "size": self.frame_size},
-                controls={"FrameRate": 1, "ExposureTime": 50000},
+            self.config = self.picam2.create_still_configuration(
+                {"size": self.frame_size},
+                controls={"ExposureTime": 500000},
                 transform=libcamera.Transform(vflip=1),
             )
-            self.picam2.configure(config)
+            self.picam2.configure(self.config)
             self.picam2.start()
         except Exception as e:
             print(f"Error initializing Raspberry Pi camera: {e}")
@@ -218,8 +218,11 @@ class DataRecorder():
             success = False
             if platform.system() == "Linux" and hasattr(self, 'picam2'):
                 # Capture with Raspberry Pi camera
-                img = self.picam2.capture_array()
-                cv2.imwrite(image_path, cv2.cvtColor(img, cv2.COLOR_YUV420p2BGR))
+                # img = self.picam2.capture_array()
+
+                self.picam2.capture_file("image.jpg")
+
+                # cv2.imwrite(image_path, cv2.cvtColor(img, cv2.COLOR_YUV420p2BGR))
                 success = True
             elif hasattr(self, 'camera') and self.camera is not None:
                 # Capture with OpenCV
