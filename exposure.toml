@@ -10,8 +10,8 @@ time_exposures = [
     { hour = 4, minute = 0, exposure = 4000000 },   # 4:00 AM - still high exposure
     
     # Morning transition (sunrise)
-    { hour = 6, minute = 0, exposure = 2000000 },   # 6:00 AM - medium exposure
-    { hour = 7, minute = 0, exposure = 1000000 },   # 7:00 AM - lower as light increases
+    { hour = 6, minute = 0, exposure = 3000000 },   # 6:00 AM - medium exposure
+    { hour = 7, minute = 0, exposure = 2000000 },   # 7:00 AM - lower as light increases
     { hour = 8, minute = 0, exposure = 500000 },    # 8:00 AM - low exposure
     
     # Daytime
