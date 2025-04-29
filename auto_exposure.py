@@ -31,8 +31,8 @@ class DataRecorder():
         self.max_exposure_attempts = 5
         
         # Exposure adjustment factors
-        self.min_exposure = 5000    # Minimum exposure time (microseconds)
-        self.max_exposure = 1000000  # Maximum exposure time (microseconds)
+        self.min_exposure = 50000    # Minimum exposure time (microseconds)
+        self.max_exposure = 10000000  # Maximum exposure time (microseconds)
         
         # Load camera settings from TOML file
         self.config_file = config_file
