@@ -171,10 +171,6 @@ class DataRecorder():
         except Exception as e:
             print(f"Warning: Could not initialize camera: {e}")
             self.camera = None
-        
-
-    
-
     
     def calculate_image_quality(self, image):
         """Calculate image quality metrics including brightness, contrast, and histogram distribution"""
