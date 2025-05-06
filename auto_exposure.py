@@ -442,7 +442,8 @@ class DataRecorder():
                 'contrast_ratio': 0
             }
     
-    def capture_test_frame(self, exposure_time=None):
+
+    def capture_test_frame(self, exposure_time=None, exposure_tolerance=50):
         """Capture a test frame to analyze brightness"""
         try:
             if platform.system() == "Linux" and hasattr(self, 'picam2'):
@@ -453,7 +454,13 @@ class DataRecorder():
                 # Capture a frame (lower resolution for speed)
                 test_config = self.picam2.create_still_configuration({"size": (1920, 1080)})
                 self.picam2.switch_mode(test_config)
-                buffer = self.picam2.capture_array("main")
+                for i in range(5):
+                    print('i, ', i)
+                    buffer = self.picam2.capture_array("main")
+                    realtime_exposure = self.picam2.capture_metadata()['ExposureTime']
+                    print('exposure, ', realtime_exposure)
+                    if exposure_time and abs(realtime_exposure - exposure_time) <= exposure_tolerance:
+                        break
                 
                 # Switch back to full resolution
                 self.picam2.switch_mode(self.config)
@@ -469,7 +476,8 @@ class DataRecorder():
         except Exception as e:
             print(f"Error capturing test frame: {e}")
             return None
-            
+
+
     def get_starting_exposure(self):
         """Get a good starting exposure value based on time of day and recent history"""
         # Start with time-based exposure as baseline

@@ -37,7 +37,7 @@ class DataRecorder():
         self.max_exposure = 10000000  # Maximum exposure time (microseconds)
         
         # Histogram-based contrast analysis
-        self.enable_histogram_analysis = True
+        self.enable_histogram_analysis = False
         self.target_contrast_range = (40, 200)  # Target range for most pixels
         
         # Multiple sampling for each brightness assessment
@@ -230,7 +230,7 @@ class DataRecorder():
                 # Capture a frame (lower resolution for speed)
                 test_config = self.picam2.create_still_configuration({"size": (1920, 1080)})
                 self.picam2.switch_mode(test_config)
-                for i in range(3):
+                for i in range(5):
                     buffer = self.picam2.capture_array("main")
                     realtime_exposure = self.picam2.capture_metadata['Exposure']
                     if exposure_time and abs(realtime_exposure - exposure_time) <= exposure_tolerance:
@@ -266,79 +266,6 @@ class DataRecorder():
         
         return base_exposure
     
-    def analyze_image_histogram(self, image):
-        """Analyze image histogram to check for proper exposure distribution"""
-        try:
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image
-                
-            # Calculate histogram
-            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-            hist = hist.flatten()
-            
-            # Check for overexposure (too many bright pixels)
-            bright_pixels = np.sum(hist[220:]) / np.sum(hist)
-            
-            # Check for underexposure (too many dark pixels)
-            dark_pixels = np.sum(hist[:30]) / np.sum(hist)
-            
-            # Calculate the percentage of pixels in the ideal middle range
-            midrange_pixels = np.sum(hist[self.target_contrast_range[0]:self.target_contrast_range[1]]) / np.sum(hist)
-            
-            return {
-                'overexposed': bright_pixels > 0.15,  # More than 15% very bright pixels
-                'underexposed': dark_pixels > 0.15,   # More than 15% very dark pixels
-                'midrange_percent': midrange_pixels * 100,
-                'dark_percent': dark_pixels * 100,
-                'bright_percent': bright_pixels * 100
-            }
-        except Exception as e:
-            print(f"Error analyzing image histogram: {e}")
-            return {'overexposed': False, 'underexposed': False, 'midrange_percent': 0}
-    
-    def binary_search_exposure(self, min_exp, max_exp, led_used=False):
-        """Use binary search to find the optimal exposure value faster"""
-        # Start with the midpoint of min and max
-        iterations = 0
-        max_iterations = 5  # Limit iterations to avoid endless loops
-        
-        while min_exp < max_exp and iterations < max_iterations:
-            mid_exp = (min_exp + max_exp) // 2
-            print(f"Binary search iteration {iterations+1}: Testing exposure {mid_exp} μs")
-            
-            # Capture test frame with current exposure
-            test_frame = self.capture_test_frame(mid_exp)
-            
-            if test_frame is None:
-                print("Failed to capture test frame during binary search")
-                return mid_exp
-                
-            # Calculate brightness
-            metrics = self.calculate_image_quality(test_frame)
-            brightness = metrics['avg_brightness']
-            
-            print(f"  Test brightness: {brightness:.1f} (target: {self.target_brightness})")
-            
-            # Check if we're within tolerance
-            if abs(brightness - self.target_brightness) <= self.brightness_tolerance:
-                print(f"  Found acceptable exposure: {mid_exp} μs gives brightness {brightness:.1f}")
-                return mid_exp
-            
-            # Adjust search space
-            if brightness < self.target_brightness:
-                # Image too dark, increase exposure (search upper half)
-                min_exp = mid_exp
-            else:
-                # Image too bright, decrease exposure (search lower half)
-                max_exp = mid_exp
-                
-            iterations += 1
-            
-        # Return the middle value if we couldn't converge
-        return (min_exp + max_exp) // 2
-    
     def adjust_exposure(self, led_required=False):
         """Enhanced auto-adjust exposure using test frames until target brightness is achieved"""
         if not self.auto_exposure:
@@ -362,18 +289,18 @@ class DataRecorder():
             
             print(f"Auto-exposure starting with base exposure: {current_exposure} μs")
             
-            # Quick binary search to get close to target brightness
-            if self.max_exposure / self.min_exposure >= 4:  # Only worth it for large exposure ranges
-                current_exposure = self.binary_search_exposure(
-                    min_exp=max(self.min_exposure, int(current_exposure * 0.5)),
-                    max_exp=min(self.max_exposure, int(current_exposure * 2.0)),
-                    led_used=led_used
-                )
-            
+
             # Fine-tune with iterative steps
             avg_brightness = 0
             contrast = 0
             hist_analysis = {}
+
+            # while True:
+            #     frame = self.capture_test_frame(current_exposure)
+            #     if frame is not None:
+            #         metrics = self.calculate_image_quality(frame)
+            #         brightness = metrics['avg_brightness']
+            #         if brightness 
             
             for attempt in range(self.max_exposure_attempts):
                 # Capture multiple test frames and average the results for stability
