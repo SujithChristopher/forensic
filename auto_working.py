@@ -10,7 +10,7 @@ from datetime import datetime
 os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 
 class DataRecorder():
-    def __init__(self, use_led=True, night_led_only=True, config_file="exposure.toml", auto_exposure=True):
+    def __init__(self, use_led=True, night_led_only=True, config_file="/home/rpi2/Documents/forensic/exposure.toml", auto_exposure=True):
         self.frame_size = (4608, 2592)
         
         # Flag to control LED usage during image capture
@@ -23,13 +23,13 @@ class DataRecorder():
         self.auto_exposure = auto_exposure
         
         # Target brightness level for auto-exposure (0-255)
-        self.target_brightness = 120  # Medium brightness
+        self.target_brightness = 180  # Medium brightness
         
         # Brightness tolerance (how close we need to get to target)
         self.brightness_tolerance = 20  # Tighter tolerance for more uniform results
         
         # Max number of attempts for auto-exposure
-        self.max_exposure_attempts = 3  # Increased for more precise adjustment
+        self.max_exposure_attempts = 5  # Increased for more precise adjustment
         
         # Exposure adjustment factors
         self.min_exposure = 5000    # Minimum exposure time (microseconds)
