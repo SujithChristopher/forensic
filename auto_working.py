@@ -43,7 +43,7 @@ class DataRecorder():
         self.exposure_settings = self.load_exposure_settings()
         
         # Create base data directory
-        self.data_dir = "data"
+        self.data_dir = "/home/rpi2/Documents/forensic/data"
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
         
