@@ -35,10 +35,6 @@ class DataRecorder():
         self.min_exposure = 5000    # Minimum exposure time (microseconds)
         self.max_exposure = 10000000  # Maximum exposure time (microseconds)
         
-        # Histogram-based contrast analysis
-        self.enable_histogram_analysis = False
-        self.target_contrast_range = (40, 200)  # Target range for most pixels
-        
         # Multiple sampling for each brightness assessment
         self.num_test_samples = 1
         
@@ -443,7 +439,6 @@ class DataRecorder():
                 'contrast_ratio': 0
             }
     
-
     def capture_test_frame(self, exposure_time=None, exposure_tolerance=50):
         """Capture a test frame to analyze brightness"""
         try:
@@ -457,10 +452,9 @@ class DataRecorder():
                 self.picam2.switch_mode(test_config)
                 self.picam2.set_controls({'ExposureTime': exposure_time})
                 for i in range(5):
-                    print('i, ', i)
                     buffer = self.picam2.capture_array("main")
                     realtime_exposure = self.picam2.capture_metadata()['ExposureTime']
-                    print('exposure, ', realtime_exposure)
+                    print(f"Real exposure: {realtime_exposure} μs")
                     if exposure_time and abs(realtime_exposure - exposure_time) <= exposure_tolerance:
                         break
                 
@@ -479,7 +473,6 @@ class DataRecorder():
             print(f"Error capturing test frame: {e}")
             return None
 
-
     def get_starting_exposure(self):
         """Get a good starting exposure value based on time of day and recent history"""
         # Start with time-based exposure as baseline
@@ -495,81 +488,8 @@ class DataRecorder():
         
         return base_exposure
     
-    def analyze_image_histogram(self, image):
-        """Analyze image histogram to check for proper exposure distribution"""
-        try:
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image
-                
-            # Calculate histogram
-            hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
-            hist = hist.flatten()
-            
-            # Check for overexposure (too many bright pixels)
-            bright_pixels = np.sum(hist[220:]) / np.sum(hist)
-            
-            # Check for underexposure (too many dark pixels)
-            dark_pixels = np.sum(hist[:30]) / np.sum(hist)
-            
-            # Calculate the percentage of pixels in the ideal middle range
-            midrange_pixels = np.sum(hist[self.target_contrast_range[0]:self.target_contrast_range[1]]) / np.sum(hist)
-            
-            return {
-                'overexposed': bright_pixels > 0.15,  # More than 15% very bright pixels
-                'underexposed': dark_pixels > 0.15,   # More than 15% very dark pixels
-                'midrange_percent': midrange_pixels * 100,
-                'dark_percent': dark_pixels * 100,
-                'bright_percent': bright_pixels * 100
-            }
-        except Exception as e:
-            print(f"Error analyzing image histogram: {e}")
-            return {'overexposed': False, 'underexposed': False, 'midrange_percent': 0}
-    
-    def binary_search_exposure(self, min_exp, max_exp, led_used=False):
-        """Use binary search to find the optimal exposure value faster"""
-        # Start with the midpoint of min and max
-        iterations = 0
-        max_iterations = 5  # Limit iterations to avoid endless loops
-        
-        while min_exp < max_exp and iterations < max_iterations:
-            mid_exp = (min_exp + max_exp) // 2
-            print(f"Binary search iteration {iterations+1}: Testing exposure {mid_exp} μs")
-            
-            # Capture test frame with current exposure
-            test_frame = self.capture_test_frame(mid_exp)
-            
-            if test_frame is None:
-                print("Failed to capture test frame during binary search")
-                return mid_exp
-                
-            # Calculate brightness
-            metrics = self.calculate_image_quality(test_frame)
-            brightness = metrics['avg_brightness']
-            
-            print(f"  Test brightness: {brightness:.1f} (target: {self.target_brightness})")
-            
-            # Check if we're within tolerance
-            if abs(brightness - self.target_brightness) <= self.brightness_tolerance:
-                print(f"  Found acceptable exposure: {mid_exp} μs gives brightness {brightness:.1f}")
-                return mid_exp
-            
-            # Adjust search space
-            if brightness < self.target_brightness:
-                # Image too dark, increase exposure (search upper half)
-                min_exp = mid_exp
-            else:
-                # Image too bright, decrease exposure (search lower half)
-                max_exp = mid_exp
-                
-            iterations += 1
-            
-        # Return the middle value if we couldn't converge
-        return (min_exp + max_exp) // 2
-    
-    def adjust_exposure(self, led_required=False):
-        """Enhanced auto-adjust exposure using test frames until target brightness is achieved"""
+    def simple_adjust_exposure(self, led_required=False):
+        """Simplified auto-adjust exposure using test frames and calculate_image_quality"""
         if not self.auto_exposure:
             return self.get_current_exposure_time()
             
@@ -582,91 +502,51 @@ class DataRecorder():
         try:
             # Get starting exposure based on time and history
             base_exposure = self.get_starting_exposure()
-            
-            # Start a little lower than the base exposure to avoid overexposure
-            current_exposure = int(base_exposure * 0.9)
+            current_exposure = base_exposure
             
             # Ensure within min/max bounds
             current_exposure = max(self.min_exposure, min(self.max_exposure, current_exposure))
             
             print(f"Auto-exposure starting with base exposure: {current_exposure} μs")
             
-            # Quick binary search to get close to target brightness
-            if self.max_exposure / self.min_exposure >= 4:  # Only worth it for large exposure ranges
-                current_exposure = self.binary_search_exposure(
-                    min_exp=max(self.min_exposure, int(current_exposure * 0.5)),
-                    max_exp=min(self.max_exposure, int(current_exposure * 2.0)),
-                    led_used=led_used
-                )
-            
-            # Fine-tune with iterative steps
+            # Simple iterative approach for exposure adjustment
             avg_brightness = 0
             contrast = 0
-            hist_analysis = {}
             
             for attempt in range(self.max_exposure_attempts):
-                # Capture multiple test frames and average the results for stability
-                brightness_samples = []
-                test_frame = None
+                # Capture test frame with current exposure
+                test_frame = self.capture_test_frame(current_exposure)
                 
-                for _ in range(self.num_test_samples):
-                    frame = self.capture_test_frame(current_exposure)
-                    if frame is not None:
-                        test_frame = frame  # Keep the last valid frame
-                        metrics = self.calculate_image_quality(frame)
-                        brightness_samples.append(metrics['avg_brightness'])
-                
-                if not brightness_samples:
-                    print("Failed to capture any test frames, using base exposure")
+                if test_frame is None:
+                    print("Failed to capture test frame, using base exposure")
                     return base_exposure
                 
-                # Use median brightness to reduce impact of outliers
-                avg_brightness = np.median(brightness_samples)
-                
-                # Get more detailed image metrics
+                # Use calculate_image_quality to assess the brightness
                 metrics = self.calculate_image_quality(test_frame)
+                avg_brightness = metrics['avg_brightness']
                 contrast = metrics['contrast_ratio']
-                
-                # Analyze histogram distribution
-                if self.enable_histogram_analysis:
-                    hist_analysis = self.analyze_image_histogram(test_frame)
-                    print(f"Histogram analysis: {hist_analysis['midrange_percent']:.1f}% midrange, " +
-                          f"{hist_analysis['dark_percent']:.1f}% dark, {hist_analysis['bright_percent']:.1f}% bright")
                 
                 print(f"Test frame {attempt+1}: Exposure={current_exposure} μs, " +
                       f"Brightness={avg_brightness:.1f}, Contrast={contrast:.1f}")
                 
-                # Check if we're within tolerance of target brightness and histogram looks good
-                is_brightness_good = abs(avg_brightness - self.target_brightness) <= self.brightness_tolerance
-                is_histogram_good = not self.enable_histogram_analysis or hist_analysis.get('midrange_percent', 0) >= 50
-                
-                if is_brightness_good and is_histogram_good:
+                # Check if we're within tolerance of target brightness
+                if abs(avg_brightness - self.target_brightness) <= self.brightness_tolerance:
                     print(f"Target brightness achieved: {avg_brightness:.1f} (target: {self.target_brightness})")
                     break
-                    
-                # Calculate adjustment factor based on how far we are from target
+                
+                # Simple proportional adjustment
                 brightness_ratio = self.target_brightness / max(1, avg_brightness)
                 
-                # Use smaller adjustment steps as we get closer to target
-                proximity_factor = min(1.0, abs(avg_brightness - self.target_brightness) / 50.0)
-                
-                # Apply adjustment, limiting change rate more as we get closer to target
-                adjustment_factor = 1.0 + (brightness_ratio - 1.0) * proximity_factor
-                adjustment_factor = max(0.9, min(5, adjustment_factor))  # Limit extreme adjustments
+                # Limit adjustment factor to avoid oscillation
+                if brightness_ratio > 1:
+                    # Image too dark - increase exposure (cap at 1.5x to avoid overshooting)
+                    adjustment_factor = min(brightness_ratio, 1.5)
+                else:
+                    # Image too bright - decrease exposure (floor at 0.7x to avoid overshooting)
+                    adjustment_factor = max(brightness_ratio, 0.7)
                 
                 # Calculate new exposure time
                 new_exposure = int(current_exposure * adjustment_factor)
-                
-                # Account for histogram analysis in adjustment
-                if self.enable_histogram_analysis:
-                    if hist_analysis.get('overexposed', False):
-                        # Reduce exposure even more for overexposed images
-                        new_exposure = int(new_exposure * 0.8)
-                        print("Reducing exposure further due to overexposure")
-                    elif hist_analysis.get('underexposed', False):
-                        # Increase exposure for underexposed images
-                        new_exposure = int(new_exposure * 1.2)
-                        print("Increasing exposure further due to underexposure")
                 
                 # Enforce min/max limits
                 new_exposure = max(self.min_exposure, min(self.max_exposure, new_exposure))
@@ -697,15 +577,14 @@ class DataRecorder():
             if led_used:
                 self.led_off()
                 
-                    
-    def log_exposure_data(self, initial_exposure, final_exposure, brightness, led_used):
+    def log_exposure_data(self, initial_exposure, final_exposure, brightness, contrast, led_used):
         """Log exposure adjustment data to CSV"""
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
             with open(self.exposure_csv, 'a', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([timestamp, initial_exposure, final_exposure, f"{brightness:.1f}", led_used])
+                writer.writerow([timestamp, initial_exposure, final_exposure, f"{brightness:.1f}", f"{contrast:.1f}", led_used])
         except Exception as e:
             print(f"Error logging exposure data: {e}")
     
@@ -716,9 +595,9 @@ class DataRecorder():
                 # Determine if LED will be used for final image
                 led_required = self.should_use_led()
                 
-                # Get the optimal exposure time
+                # Get the optimal exposure time using simplified approach
                 if self.auto_exposure:
-                    exposure_time = self.adjust_exposure(led_required)
+                    exposure_time = self.simple_adjust_exposure(led_required)
                 else:
                     exposure_time = self.get_current_exposure_time()
                 
@@ -731,6 +610,25 @@ class DataRecorder():
             except Exception as e:
                 print(f"Error updating camera exposure: {e}")
         return False
+    
+    def log_image_quality(self, image_path, metrics, exposure_time):
+        """Log image quality metrics to CSV"""
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            filename = os.path.basename(image_path)
+            
+            with open(self.quality_csv, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    timestamp, 
+                    filename, 
+                    f"{metrics['avg_brightness']:.1f}", 
+                    f"{metrics['contrast_ratio']:.1f}", 
+                    f"{metrics['hist_std']:.1f}",
+                    exposure_time
+                ])
+        except Exception as e:
+            print(f"Error logging image quality: {e}")
     
     def capture_image(self):
         """Capture and save an image with timestamp"""
@@ -754,19 +652,20 @@ class DataRecorder():
             
             # Capture the image
             success = False
+            image_frame = None
+            
             if platform.system() == "Linux" and hasattr(self, 'picam2'):
                 # Capture with Raspberry Pi camera
-                self.picam2.capture_file(image_path)
+                image_frame = self.picam2.capture_array("main")
+                if image_frame is not None:
+                    cv2.imwrite(image_path, image_frame)
+                    success = True
                 
-                # Add exposure info to EXIF metadata (will be embedded in JPG)
-                # For PiCamera2, this is already included in the image metadata
-                
-                success = True
             elif hasattr(self, 'camera') and self.camera is not None:
                 # Capture with OpenCV
-                ret, frame = self.camera.read()
+                ret, image_frame = self.camera.read()
                 if ret:
-                    cv2.imwrite(image_path, frame)
+                    cv2.imwrite(image_path, image_frame)
                     success = True
                 else:
                     print("Warning: Could not capture image")
@@ -777,15 +676,19 @@ class DataRecorder():
             if led_used:
                 self.led_off()
             
-            if success:
-                print(f"Image saved: {image_path} (Exposure: {self.last_exposure_time} μs)")
+            if success and image_frame is not None:
+                # Calculate and log image quality metrics
+                metrics = self.calculate_image_quality(image_frame)
+                self.log_image_quality(image_path, metrics, self.last_exposure_time)
+                
+                print(f"Image saved: {image_path} (Exposure: {self.last_exposure_time} μs, Brightness: {metrics['avg_brightness']:.1f})")
                 
         except Exception as e:
             print(f"Error capturing image: {e}")
             # Ensure LED is turned off in case of error
             if self.use_led:
                 self.led_off()
-    
+                
     def log_temperature(self, temperatures):
         """Log temperature data to the CSV file"""
         try:

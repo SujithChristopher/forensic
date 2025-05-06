@@ -250,10 +250,10 @@ class DataRecorder():
                 while True:
                     image = self.picam2.capture_array()
                     brightness = self.calculate_image_quality(image)['avg_brightness']
-
+                    print('brightness', brightness)
                     if abs(brightness - self.desired_brightness) <= self.brightness_tolerance:
                         break
-
+                    
                     # Adjust exposure time based on brightness
                     if brightness < self.desired_brightness:
                         self.desired_exposure_time += 20000  # Increase exposure time
