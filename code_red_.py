@@ -2,24 +2,24 @@ from twilio.rest import Client
 import time
 
 
-# class SendMessage:
-#     def __init__(self):
-#         self.account_sid = None
-#         self.auth_token = None
-#         self.client = Client(self.account_sid, self.auth_token)
+class SendMessage:
+    def __init__(self):
+        self.account_sid = None
+        self.auth_token = None
+        self.client = Client(self.account_sid, self.auth_token)
 
-#         self.message = self.client.messages.create(
-#             from_="+17752274344", body="Testing my message", to="+918489878428"
-#         )
+        self.message = self.client.messages.create(
+            from_="+17752274344", body="Testing my message", to="+918489878428"
+        )
 
-#     def alert_people(self):
-#         call_numbers = ["+918489878428", "+919007424748"]
+    def alert_people(self):
+        call_numbers = ["+918489878428", "+919007424748"]
 
-#         for _c in call_numbers:
-#             call = self.client.calls.create(
-#                 from_="+17752274344",
-#                 to=_c,
-#                 url="http://demo.twilio.com/docs/voice.xml",
-#             )
-#             print(call.sid)
-#             time.sleep(2)
+        for _c in call_numbers:
+            call = self.client.calls.create(
+                from_="+17752274344",
+                to=_c,
+                url="http://demo.twilio.com/docs/voice.xml",
+            )
+            print(call.sid)
+            time.sleep(2)
