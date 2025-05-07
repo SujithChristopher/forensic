@@ -4,12 +4,14 @@ import toml
 
 
 # import secrets
+_pth = '/home/rpi2/Documents/secrets.toml'
 
+secrets = toml.load(_pth)['secrets']
 
 class SendMessage:
     def __init__(self):
-        self.account_sid = None
-        self.auth_token = None
+        self.account_sid = secrets['account_sid']
+        self.auth_token = secrets['auth_token']
         self.client = Client(self.account_sid, self.auth_token)
         
     def send_message(self, message = "NO POWER"):
