@@ -7,9 +7,10 @@ class SendMessage:
         self.account_sid = None
         self.auth_token = None
         self.client = Client(self.account_sid, self.auth_token)
-
+        
+    def send_message(self, message = "NO POWER"):
         self.message = self.client.messages.create(
-            from_="+17752274344", body="Testing my message", to="+918489878428"
+            from_="+17752274344", body=message, to="+918489878428"
         )
 
     def alert_people(self):
