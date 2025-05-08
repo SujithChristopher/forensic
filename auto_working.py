@@ -9,6 +9,8 @@ import numpy as np
 from datetime import datetime
 os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 
+from power_failure_monitor import PowerFailureMonitor
+
 class DataRecorder():
     def __init__(self, use_led=True, night_led_only=True, config_file="/home/rpi2/Documents/forensic/exposure.toml", auto_exposure=True):
         self.frame_size = (4608, 2592)
@@ -72,6 +74,9 @@ class DataRecorder():
         # Store recent successful exposure times to improve stability
         self.recent_exposures = []
         self.max_exposure_history = 5
+        
+        monitor = PowerFailureMonitor()
+        monitor.start()
     
     def load_exposure_settings(self):
         """Load exposure settings from TOML file"""

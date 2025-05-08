@@ -2,3 +2,4 @@ venv
 data
 .ruff_cache
 output
+__pycache__

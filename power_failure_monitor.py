@@ -55,6 +55,7 @@ class PowerFailureMonitor(threading.Thread):
         self.alert_timer = None
         self.running = False
         self.monitor_thread = None
+        self.alerted = False  # Flag to track if we've already alerted for current power failure
         
         # Setup resources
         self.load_configs()
@@ -133,20 +134,25 @@ class PowerFailureMonitor(threading.Thread):
 
     def handle_power_failure(self):
         """Handle the power failure event after waiting for delay"""
-        logging.warning("Power failure confirmed after wait period. Sending alerts...")
-        
-        try:
-            # Send SMS alerts
-            self.send_sms_alerts()
+        # Only send alerts if we haven't already alerted for this power failure
+        if not self.alerted:
+            logging.warning("Power failure confirmed after wait period. Sending alerts...")
             
-            # Make phone calls
-            self.make_phone_calls()
-            
-            logging.info("All alerts sent successfully")
-        except Exception as e:
-            logging.error(f"Error during alert process: {e}")
-        
-        self.power_failure_detected = False  # Reset the flag
+            try:
+                # Send SMS alerts
+                self.send_sms_alerts()
+                
+                # Make phone calls
+                self.make_phone_calls()
+                
+                # Mark that we've sent alerts for this power failure
+                self.alerted = True
+                
+                logging.info("All alerts sent successfully")
+            except Exception as e:
+                logging.error(f"Error during alert process: {e}")
+        else:
+            logging.info("Power failure still ongoing. Already alerted, not sending duplicate alerts.")
         
     def start_alert_timer(self):
         """Start the timer before sending alerts"""
@@ -162,11 +168,23 @@ class PowerFailureMonitor(threading.Thread):
         if self.alert_timer and self.alert_timer.is_alive():
             self.alert_timer.cancel()
             logging.info("Power restored. Alert cancelled.")
-            self.power_failure_detected = False
+        
+        # Reset the power failure state
+        self.power_failure_detected = False
+        
+        # Reset the alerted state so we can alert on the next power failure
+        self.alerted = False
+        logging.info("Alert state reset. System will alert on next power failure.")
 
     def monitor_power(self):
         """Continuously monitor power status"""
         self.setup_gpio()  # Setup GPIO when monitoring starts
+        
+        # Initially assume power is on and we haven't alerted
+        self.power_failure_detected = False
+        self.alerted = False
+        
+        logging.info("Starting power monitoring")
         
         try:
             while self.running:
