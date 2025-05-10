@@ -7,13 +7,20 @@ import csv
 from datetime import datetime
 
 class DataRecorder():
-    def __init__(self):
+    def __init__(self, use_led=True):
         self.frame_size = (1280, 720)
+        
+        # Flag to control LED usage during image capture
+        self.use_led = use_led
         
         # Create base data directory
         self.data_dir = "data"
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
+        
+        # Initialize LED if on Linux and LED is enabled
+        if platform.system() == "Linux" and self.use_led:
+            self._init_led()
         
         # Initialize camera based on platform
         if platform.system() == "Linux":
@@ -29,6 +36,37 @@ class DataRecorder():
         
         # Last image capture timestamp
         self.last_image_time = 0
+    
+    def _init_led(self):
+        """Initialize LED control"""
+        try:
+            import gpiod
+            self.LED_PIN = 27
+            self.chip = gpiod.Chip('gpiochip4')
+            self.led_line = self.chip.get_line(self.LED_PIN)
+            self.led_line.request(consumer="LED", type=gpiod.LINE_REQ_DIR_OUT, default_vals=[0])
+            print("LED initialized successfully")
+        except Exception as e:
+            print(f"Error initializing LED: {e}")
+            self.use_led = False
+    
+    def led_on(self):
+        """Turn LED on"""
+        if platform.system() == "Linux" and self.use_led and hasattr(self, 'led_line'):
+            try:
+                self.led_line.set_value(1)
+                print("LED turned ON")
+            except Exception as e:
+                print(f"Error turning LED on: {e}")
+    
+    def led_off(self):
+        """Turn LED off"""
+        if platform.system() == "Linux" and self.use_led and hasattr(self, 'led_line'):
+            try:
+                self.led_line.set_value(0)
+                print("LED turned OFF")
+            except Exception as e:
+                print(f"Error turning LED off: {e}")
    
     def _init_rpi_camera(self):
         try:
@@ -170,23 +208,42 @@ class DataRecorder():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             image_path = os.path.join(self.day_dir, f"image_{timestamp}.jpg")
             
+            # Turn on LED if enabled
+            if self.use_led:
+                self.led_on()
+                # Small delay to let the LED fully illuminate
+                time.sleep(0.5)
+            
+            # Capture the image
+            success = False
             if platform.system() == "Linux" and hasattr(self, 'picam2'):
                 # Capture with Raspberry Pi camera
                 img = self.picam2.capture_array()
                 cv2.imwrite(image_path, cv2.cvtColor(img, cv2.COLOR_YUV420p2BGR))
-                print(f"Image saved: {image_path}")
+                success = True
             elif hasattr(self, 'camera') and self.camera is not None:
                 # Capture with OpenCV
                 ret, frame = self.camera.read()
                 if ret:
                     cv2.imwrite(image_path, frame)
-                    print(f"Image saved: {image_path}")
+                    success = True
                 else:
                     print("Warning: Could not capture image")
             else:
                 print("Warning: No camera available to capture image")
+            
+            # Turn off LED after capturing
+            if self.use_led:
+                self.led_off()
+            
+            if success:
+                print(f"Image saved: {image_path}")
+                
         except Exception as e:
             print(f"Error capturing image: {e}")
+            # Ensure LED is turned off in case of error
+            if self.use_led:
+                self.led_off()
     
     def log_temperature(self, temperatures):
         """Log temperature data to the CSV file"""
@@ -208,6 +265,7 @@ class DataRecorder():
         print(f"Starting data recording. Images saved every minute, temperature recorded every second.")
         print(f"Data directory: {self.data_dir}")
         print(f"Using up to {self.num_sensors} temperature sensors")
+        print(f"LED for image capture: {'ENABLED' if self.use_led else 'DISABLED'}")
         
         try:
             while True:
@@ -249,8 +307,18 @@ class DataRecorder():
                 
         except KeyboardInterrupt:
             print("Recording stopped by user")
+            # Ensure LED is off when exiting
+            if self.use_led:
+                self.led_off()
             if platform.system() != "Linux" and hasattr(self, 'camera') and self.camera is not None:
                 self.camera.release()
 
 if __name__ == "__main__":
-    DataRecorder().main()
+    # To enable LED during image capture (default):
+    # DataRecorder(use_led=True).main()
+    
+    # To disable LED during image capture:
+    # DataRecorder(use_led=False).main()
+    
+    # Default is LED enabled
+    DataRecorder(use_led=True).main()
