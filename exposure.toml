@@ -1,0 +1,35 @@
+# Camera Exposure Configuration
+
+[exposure]
+# Time-based exposure settings
+# Format: array of objects with hour, minute, and exposure time in microseconds
+# The program will use the most recent time setting for the current time
+time_exposures = [
+    # Early morning (before sunrise)
+    { hour = 0, minute = 0, exposure = 5000000 },   # 12:00 AM - high exposure
+    { hour = 4, minute = 0, exposure = 4000000 },   # 4:00 AM - still high exposure
+    
+    # Morning transition (sunrise)
+    { hour = 6, minute = 0, exposure = 3000000 },   # 6:00 AM - medium exposure
+    { hour = 7, minute = 0, exposure = 2000000 },   # 7:00 AM - lower as light increases
+    { hour = 8, minute = 0, exposure = 500000 },    # 8:00 AM - low exposure
+    
+    # Daytime
+    { hour = 10, minute = 0, exposure = 200000 },   # 10:00 AM - bright daylight 
+    { hour = 12, minute = 0, exposure = 100000 },   # 12:00 PM - minimum exposure (brightest)
+    { hour = 15, minute = 0, exposure = 200000 },   # 3:00 PM - slightly higher
+    
+    # Evening transition (sunset)
+    { hour = 17, minute = 0, exposure = 500000 },   # 5:00 PM - medium exposure
+    { hour = 18, minute = 0, exposure = 1000000 },  # 6:00 PM - higher as light decreases
+    { hour = 19, minute = 30, exposure = 3000000 }, # 7:30 PM - high exposure
+    
+    # Night
+    { hour = 21, minute = 0, exposure = 5000000 }   # 9:00 PM - maximum exposure
+]
+
+# Day/night boundaries for LED control
+# This determines when to use LED if night_led_only is enabled
+[exposure.day]
+start_hour = 6   # 6 AM
+end_hour = 19    # 7 PM
