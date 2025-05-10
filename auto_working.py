@@ -273,7 +273,8 @@ class DataRecorder():
     def _update_day_paths(self):
         """Update paths for the current day"""
         current_date = datetime.now().strftime("%Y-%m-%d")
-        self.day_str = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
+        
+        self.day_str = f"{current_date}"
         
         # Create day directory for images
         self.day_dir = os.path.join(self.data_dir, self.day_str)
@@ -735,7 +736,11 @@ class DataRecorder():
             while True:
                 try:
                     # Check if we need to update day directory
-                    current_day = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
+                    
+                    # current_date = datetime.now()
+                    # current_day = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
+                    
+                    current_day = datetime.now().strftime("%Y-%m-%d")
                     if current_day != self.day_str:
                         self._update_day_paths()
                         print(f"New day detected. Saving to {self.day_dir}")
