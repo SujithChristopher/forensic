@@ -75,8 +75,8 @@ class DataRecorder():
         self.recent_exposures = []
         self.max_exposure_history = 5
         
-        monitor = PowerFailureMonitor()
-        monitor.start()
+        # monitor = PowerFailureMonitor()
+        # monitor.start()
     
     def load_exposure_settings(self):
         """Load exposure settings from TOML file"""
