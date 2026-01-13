@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime
 os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 
-from power_failure_monitor import PowerFailureMonitor
+# from power_failure_monitor import PowerFailureMonitor
 
 class DataRecorder():
     def __init__(self, use_led=True, night_led_only=True, config_file="/home/rpi2/Documents/forensic/exposure.toml", auto_exposure=True):
@@ -25,7 +25,7 @@ class DataRecorder():
         self.auto_exposure = auto_exposure
         
         # Target brightness level for auto-exposure (0-255)
-        self.target_brightness = 180  # Medium brightness
+        self.target_brightness = 100  # Medium brightness
         
         # Brightness tolerance (how close we need to get to target)
         self.brightness_tolerance = 20  # Tighter tolerance for more uniform results
@@ -459,6 +459,8 @@ class DataRecorder():
                 self.picam2.set_controls({'ExposureTime': exposure_time})
                 for i in range(5):
                     buffer = self.picam2.capture_array("main")
+                    # Convert RGB to BGR (picamera2 returns RGB format)
+                    buffer = cv2.cvtColor(buffer, cv2.COLOR_RGB2BGR)
                     realtime_exposure = self.picam2.capture_metadata()['ExposureTime']
                     print(f"Real exposure: {realtime_exposure} μs")
                     if exposure_time and abs(realtime_exposure - exposure_time) <= exposure_tolerance:
@@ -664,6 +666,8 @@ class DataRecorder():
                 # Capture with Raspberry Pi camera
                 image_frame = self.picam2.capture_array("main")
                 if image_frame is not None:
+                    # Convert RGB to BGR for cv2.imwrite (picamera2 returns RGB)
+                    image_frame = cv2.cvtColor(image_frame, cv2.COLOR_RGB2BGR)
                     cv2.imwrite(image_path, image_frame)
                     success = True
                 
