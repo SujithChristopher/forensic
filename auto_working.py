@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime
 os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 
-from power_failure_monitor import PowerFailureMonitor
+# from power_failure_monitor import PowerFailureMonitor
 
 class DataRecorder():
     def __init__(self, use_led=True, night_led_only=True, config_file="/home/rpi2/Documents/forensic/exposure.toml", auto_exposure=True):
