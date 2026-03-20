@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile src/config.py)",
+      "Bash(python -m py_compile src/hardware/led.py)",
+      "Bash(python -m py_compile src/hardware/camera.py)",
+      "Bash(python -m py_compile src/hardware/sensors.py)",
+      "Bash(python -m py_compile src/exposure.py)"
+    ]
+  }
+}
