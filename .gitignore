@@ -3,3 +3,5 @@ data
 .ruff_cache
 output
 __pycache__
+dist
+build
