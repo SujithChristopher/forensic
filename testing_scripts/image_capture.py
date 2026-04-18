@@ -6,15 +6,16 @@ import platform
 import csv
 from datetime import datetime
 
-class DataRecorder():
+
+class DataRecorder:
     def __init__(self):
         self.frame_size = (1280, 720)
-        
+
         # Create base data directory
         self.data_dir = "data"
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
-        
+
         # Initialize camera based on platform
         if platform.system() == "Linux":
             self._init_rpi_camera()
@@ -26,10 +27,10 @@ class DataRecorder():
             
         # Initialize day-specific paths
         self._update_day_paths()
-        
+
         # Last image capture timestamp
         self.last_image_time = 0
-   
+
     def _init_rpi_camera(self):
         try:
             from picamera2 import Picamera2
@@ -61,18 +62,18 @@ class DataRecorder():
         """Update paths for the current day"""
         current_date = datetime.now().strftime("%Y-%m-%d")
         self.day_str = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
-        
+
         # Create day directory for images
         self.day_dir = os.path.join(self.data_dir, self.day_str)
         if not os.path.exists(self.day_dir):
             os.makedirs(self.day_dir)
-            
+
         # Set up CSV file for temperature data
         self.csv_filename = os.path.join(self.day_dir, f"temp_data_{current_date}.csv")
-        
+
         # Create CSV with headers if it doesn't exist
         if not os.path.exists(self.csv_filename):
-            with open(self.csv_filename, 'w', newline='') as f:
+            with open(self.csv_filename, "w", newline="") as f:
                 writer = csv.writer(f)
                 # Create header with timestamp and sensor1 through sensor4
                 header = ['timestamp'] + [f'sensor{i+1}' for i in range(self.num_sensors)]
@@ -246,11 +247,12 @@ class DataRecorder():
                     print("Continuing to next iteration...")
                 
                 time.sleep(1)  # 1 second interval
-                
+
         except KeyboardInterrupt:
             print("Recording stopped by user")
             if platform.system() != "Linux" and hasattr(self, 'camera') and self.camera is not None:
                 self.camera.release()
+
 
 if __name__ == "__main__":
     DataRecorder().main()

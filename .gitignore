@@ -3,3 +3,7 @@ data
 .ruff_cache
 output
 __pycache__
+dist
+build
+code_red.py
+secrets.toml
