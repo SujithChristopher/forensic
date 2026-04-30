@@ -33,16 +33,20 @@ class DataRecorder():
         # Brightness tolerance (how close we need to get to target)
         self.brightness_tolerance = 20  # Tighter tolerance for more uniform results
         
-        # Max number of attempts for auto-exposure
-        self.max_exposure_attempts = 5  # Increased for more precise adjustment
-        
+        # Max number of attempts for auto-exposure (kept as fallback, not used in AEC path)
+        self.max_exposure_attempts = 5
+
         # Exposure adjustment factors
         self.min_exposure = 5000    # Minimum exposure time (microseconds)
         self.max_exposure = 10000000  # Maximum exposure time (microseconds)
-        
-        # Multiple sampling for each brightness assessment
-        self.num_test_samples = 1
-        
+
+        # Maximum analogue gain — caps noise in dark/evening conditions
+        # Higher gain = brighter but noisier; 8.0 is a reasonable limit for Pi cameras
+        self.max_analogue_gain = 8.0
+
+        # AEC settle time (seconds) — how long to wait for hardware auto-exposure to stabilise
+        self.aec_settle_time = 2.0
+
         # Load camera settings from TOML file
         # If no config_file is passed, look for "exposure.toml" in the script's directory
         if config_file is None:
@@ -458,143 +462,117 @@ class DataRecorder():
                 'contrast_ratio': 0
             }
     
-    def capture_test_frame(self, exposure_time=None, exposure_tolerance=50):
-        """Capture a test frame to analyze brightness"""
-        try:
-            if platform.system() == "Linux" and hasattr(self, 'picam2'):
-                # Set exposure if provided
-                if exposure_time:
-                    self.picam2.set_controls({'ExposureTime': exposure_time})
-                    print(f"Setting exposure time to {exposure_time} μs")
-                # Capture a frame (lower resolution for speed)
-                test_config = self.picam2.create_still_configuration({"size": (1920, 1080)})
-                self.picam2.switch_mode(test_config)
-                self.picam2.set_controls({'ExposureTime': exposure_time})
-                for i in range(5):
-                    buffer = self.picam2.capture_array("main")
-                    # Convert RGB to BGR (picamera2 returns RGB format)
-                    buffer = cv2.cvtColor(buffer, cv2.COLOR_RGB2BGR)
-                    realtime_exposure = self.picam2.capture_metadata()['ExposureTime']
-                    print(f"Real exposure: {realtime_exposure} μs")
-                    if exposure_time and abs(realtime_exposure - exposure_time) <= exposure_tolerance:
-                        break
-                
-                # Switch back to full resolution
-                self.picam2.switch_mode(self.config)
-                
-                return buffer
-            elif hasattr(self, 'camera') and self.camera is not None:
-                # With OpenCV, just return a regular frame
-                ret, frame = self.camera.read()
-                if ret:
-                    return frame
-                return None
-            return None
-        except Exception as e:
-            print(f"Error capturing test frame: {e}")
-            return None
-
-    def get_starting_exposure(self):
-        """Get a good starting exposure value based on time of day and recent history"""
-        # Start with time-based exposure as baseline
-        base_exposure = self.get_current_exposure_time()
-        
-        # If we have recent successful exposures, use their average as a better starting point
-        if len(self.recent_exposures) > 0:
-            recent_avg = sum(self.recent_exposures) / len(self.recent_exposures)
-            # Blend between time-based and recent history (70% recent, 30% time-based)
-            starting_exposure = int(0.7 * recent_avg + 0.3 * base_exposure)
-            print(f"Using blended exposure: {starting_exposure} μs (time-based: {base_exposure} μs, recent avg: {recent_avg:.0f} μs)")
-            return starting_exposure
-        
-        return base_exposure
-    
     def simple_adjust_exposure(self, led_required=False):
-        """Simplified auto-adjust exposure using test frames and calculate_image_quality"""
+        """
+        Hybrid AEC/AGC + single-pass brightness correction.
+
+        Step 1 — hardware AEC: enable the camera's built-in auto-exposure and let it
+                  settle. This handles the full 24-hour dynamic range (bright noon sun
+                  through dark midnight) far better than manual iteration.
+        Step 2 — gain cap: clamp AnalogueGain to self.max_analogue_gain. At dusk/night
+                  the camera would otherwise push gain very high, producing noisy images.
+                  If gain is clamped we compensate with a proportional exposure increase.
+        Step 3 — lock & verify: disable AEC, apply the locked values, capture one
+                  verification frame and check actual brightness against the target.
+        Step 4 — single linear correction: if brightness is outside tolerance, apply one
+                  proportional exposure adjustment (no loop → no oscillation). Log a
+                  warning if we still can't hit the target (e.g., scene is genuinely too
+                  dark even with LED and max exposure).
+        """
         if not self.auto_exposure:
             return self.get_current_exposure_time()
-            
-        # Turn on LED if needed for test frames
+
         led_used = False
         if led_required and self.should_use_led():
             led_used = self.led_on()
-            time.sleep(0.5)  # Let LED warm up
-            
+            time.sleep(0.5)  # LED warm-up
+
+        base_exposure = self.get_current_exposure_time()
+
         try:
-            # Get starting exposure based on time and history
-            base_exposure = self.get_starting_exposure()
-            current_exposure = base_exposure
-            
-            # Ensure within min/max bounds
-            current_exposure = max(self.min_exposure, min(self.max_exposure, current_exposure))
-            
-            print(f"Auto-exposure starting with base exposure: {current_exposure} μs")
-            
-            # Simple iterative approach for exposure adjustment
-            avg_brightness = 0
-            contrast = 0
-            
-            for attempt in range(self.max_exposure_attempts):
-                # Capture test frame with current exposure
-                test_frame = self.capture_test_frame(current_exposure)
-                
+            if platform.system() == "Linux" and hasattr(self, 'picam2'):
+                # --- Step 1: let hardware AEC settle ---
+                self.picam2.set_controls({'AeEnable': True})
+                time.sleep(self.aec_settle_time)
+                metadata = self.picam2.capture_metadata()
+                exposure_time = metadata['ExposureTime']
+                gain = metadata.get('AnalogueGain', 1.0)
+                print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
+
+                # --- Step 2: cap analogue gain to limit noise ---
+                if gain > self.max_analogue_gain:
+                    # Compensate the brightness loss by lengthening exposure proportionally
+                    exposure_time = min(
+                        int(exposure_time * (gain / self.max_analogue_gain)),
+                        self.max_exposure
+                    )
+                    gain = self.max_analogue_gain
+                    print(f"Gain capped at {self.max_analogue_gain:.1f}x → exposure adjusted to {exposure_time} μs")
+
+                exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
+
+                # --- Step 3: lock AEC and capture a verification frame ---
+                self.picam2.set_controls({
+                    'AeEnable': False,
+                    'ExposureTime': exposure_time,
+                    'AnalogueGain': gain,
+                })
+                time.sleep(0.3)  # let the new settings take effect
+
+                test_frame = self.picam2.capture_array("main")
                 if test_frame is None:
-                    print("Failed to capture test frame, using base exposure")
-                    return base_exposure
-                
-                # Use calculate_image_quality to assess the brightness
-                metrics = self.calculate_image_quality(test_frame)
-                avg_brightness = metrics['avg_brightness']
+                    return exposure_time
+
+                test_bgr = cv2.cvtColor(test_frame, cv2.COLOR_RGB2BGR)
+                metrics = self.calculate_image_quality(test_bgr)
+                brightness = metrics['avg_brightness']
                 contrast = metrics['contrast_ratio']
-                
-                print(f"Test frame {attempt+1}: Exposure={current_exposure} μs, " +
-                      f"Brightness={avg_brightness:.1f}, Contrast={contrast:.1f}")
-                
-                # Check if we're within tolerance of target brightness
-                if abs(avg_brightness - self.target_brightness) <= self.brightness_tolerance:
-                    print(f"Target brightness achieved: {avg_brightness:.1f} (target: {self.target_brightness})")
-                    break
-                
-                # Simple proportional adjustment
-                brightness_ratio = self.target_brightness / max(1, avg_brightness)
-                
-                # Limit adjustment factor to avoid oscillation
-                if brightness_ratio > 1:
-                    # Image too dark - increase exposure (cap at 1.5x to avoid overshooting)
-                    adjustment_factor = min(brightness_ratio, 1.5)
-                else:
-                    # Image too bright - decrease exposure (floor at 0.7x to avoid overshooting)
-                    adjustment_factor = max(brightness_ratio, 0.7)
-                
-                # Calculate new exposure time
-                new_exposure = int(current_exposure * adjustment_factor)
-                
-                # Enforce min/max limits
-                new_exposure = max(self.min_exposure, min(self.max_exposure, new_exposure))
-                
-                print(f"Adjusting exposure: {current_exposure} → {new_exposure} μs (factor: {adjustment_factor:.2f})")
-                
-                # Apply new exposure for next iteration
-                current_exposure = new_exposure
-                
-            # Log exposure data
-            self.log_exposure_data(base_exposure, current_exposure, avg_brightness, contrast, led_used)
-            
-            # Remember this exposure time for future use if it was successful
-            if abs(avg_brightness - self.target_brightness) <= self.brightness_tolerance * 1.5:
-                self.recent_exposures.append(current_exposure)
-                # Keep only the most recent N exposures
-                if len(self.recent_exposures) > self.max_exposure_history:
-                    self.recent_exposures.pop(0)
-                
-            # Return the optimized exposure time
-            return current_exposure
-            
+                print(f"Verification frame: brightness={brightness:.1f} (target={self.target_brightness}±{self.brightness_tolerance}), contrast={contrast:.1f}")
+
+                # --- Step 4: single linear correction if outside tolerance ---
+                if abs(brightness - self.target_brightness) > self.brightness_tolerance:
+                    correction = self.target_brightness / max(1.0, brightness)
+                    # Dampen large corrections to avoid overshoot
+                    correction = max(0.5, min(correction, 2.0))
+                    corrected_exposure = int(exposure_time * correction)
+                    corrected_exposure = max(self.min_exposure, min(self.max_exposure, corrected_exposure))
+                    print(f"Brightness correction: {exposure_time} → {corrected_exposure} μs (factor={correction:.2f})")
+                    self.picam2.set_controls({'ExposureTime': corrected_exposure})
+                    exposure_time = corrected_exposure
+
+                    # Re-verify after correction (informational only — no further adjustment)
+                    time.sleep(0.3)
+                    check_frame = self.picam2.capture_array("main")
+                    if check_frame is not None:
+                        check_bgr = cv2.cvtColor(check_frame, cv2.COLOR_RGB2BGR)
+                        check_metrics = self.calculate_image_quality(check_bgr)
+                        brightness = check_metrics['avg_brightness']
+                        contrast = check_metrics['contrast_ratio']
+                        print(f"Post-correction brightness={brightness:.1f}")
+                        if abs(brightness - self.target_brightness) > self.brightness_tolerance * 2:
+                            print(f"Warning: brightness {brightness:.1f} still outside target range — "
+                                  f"scene may be too dark/bright for current LED/exposure limits")
+
+            else:
+                # Non-Linux fallback: use time-based exposure directly
+                exposure_time = base_exposure
+                metrics = {'avg_brightness': self.target_brightness, 'contrast_ratio': 1.0}
+                brightness = metrics['avg_brightness']
+                contrast = metrics['contrast_ratio']
+
+            self.log_exposure_data(base_exposure, exposure_time, brightness, contrast, led_used)
+
+            # Update exposure history for informational logging
+            self.recent_exposures.append(exposure_time)
+            if len(self.recent_exposures) > self.max_exposure_history:
+                self.recent_exposures.pop(0)
+
+            return exposure_time
+
         except Exception as e:
             print(f"Error during auto-exposure: {e}")
-            return self.get_current_exposure_time()
+            return base_exposure
         finally:
-            # Make sure to turn off LED if it was turned on
             if led_used:
                 self.led_off()
                 
