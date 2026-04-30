@@ -12,7 +12,10 @@ os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 # from power_failure_monitor import PowerFailureMonitor
 
 class DataRecorder():
-    def __init__(self, use_led=True, night_led_only=True, config_file="/home/rpi2/Documents/forensic/exposure.toml", auto_exposure=True):
+    def __init__(self, use_led=True, night_led_only=True, config_file=None, auto_exposure=True):
+        # Determine the directory where this script (auto_working.py) is located
+        self.base_script_path = os.path.dirname(os.path.abspath(__file__))
+        
         self.frame_size = (4608, 2592)
         
         # Flag to control LED usage during image capture
@@ -41,13 +44,23 @@ class DataRecorder():
         self.num_test_samples = 1
         
         # Load camera settings from TOML file
-        self.config_file = config_file
+        # If no config_file is passed, look for "exposure.toml" in the script's directory
+        if config_file is None:
+            self.config_file = os.path.join(self.base_script_path, "exposure.toml")
+        else:
+            self.config_file = config_file
+            
         self.exposure_settings = self.load_exposure_settings()
         
-        # Create base data directory
-        self.data_dir = "/home/rpi2/Documents/forensic/data"
+        # Create base data directory dynamically in the script's folder
+        self.data_dir = os.path.join(self.base_script_path, "data")
         if not os.path.exists(self.data_dir):
-            os.makedirs(self.data_dir)
+            try:
+                os.makedirs(self.data_dir)
+            except PermissionError:
+                print(f"CRITICAL ERROR: No permission to create {self.data_dir}")
+                print("Try moving the script to a folder you own, or run with sudo.")
+                raise
         
         # Initialize LED if on Linux and LED is enabled
         if platform.system() == "Linux" and self.use_led:
