@@ -47,6 +47,24 @@ class DataRecorder():
         # AEC settle time (seconds) — how long to wait for hardware auto-exposure to stabilise
         self.aec_settle_time = 2.0
 
+        # If scene brightness drops below this (0-255) and LED is available, turn it on
+        # regardless of the time-based schedule — handles dusk/overcast gaps
+        self.darkness_threshold = 50
+
+        # When LED transitions off→on, AEC's settled value is from a dark scene and causes
+        # massive overshoot. Use this conservative baseline instead and let AEC re-hunt.
+        self.led_baseline_exposure = 600000  # μs — empirically from night stable values
+
+        # Track LED state across captures to detect off→on transitions
+        self.last_led_state = False
+
+        # Last brightness measured during exposure calibration — used by should_use_led()
+        # to trigger the darkness override on the next capture cycle
+        self.last_measured_brightness = None
+
+        # Max brightness correction passes per capture (each drain-confirmed)
+        self.max_correction_passes = 3
+
         # Load camera settings from TOML file
         # If no config_file is passed, look for "exposure.toml" in the script's directory
         if config_file is None:
@@ -228,10 +246,17 @@ class DataRecorder():
         """Determine if LED should be used based on time of day settings"""
         if not self.use_led:
             return False
-        
+
+        # Darkness override: if the previous cycle measured very low brightness,
+        # force LED on now regardless of the time schedule. Covers dusk/overcast gaps
+        # where it gets dark before the configured night start hour.
+        if (self.last_measured_brightness is not None
+                and self.last_measured_brightness < self.darkness_threshold):
+            return True
+
         if self.night_led_only:
             return self.is_night_time()
-        
+
         return True
     
     def led_on(self):
@@ -483,19 +508,37 @@ class DataRecorder():
                   f"(last actual={meta.get('ExposureTime')} μs, target={target_exposure} μs)")
         return frame, meta
 
+    def _run_aec_settle(self):
+        """Enable AEC and drain frames until ExposureTime stabilises across two consecutive reads."""
+        self.picam2.set_controls({'AeEnable': True})
+        prev_exposure = 0
+        meta = {}
+        for _ in range(20):
+            self.picam2.capture_array("main")
+            meta = self.picam2.capture_metadata()
+            curr = meta.get('ExposureTime', 0)
+            if abs(curr - prev_exposure) < 2000:
+                break
+            prev_exposure = curr
+        return meta.get('ExposureTime', prev_exposure), meta.get('AnalogueGain', 1.0)
+
     def simple_adjust_exposure(self, led_required=False):
         """
-        Hybrid AEC/AGC + single-pass brightness correction.
+        Hybrid AEC/AGC exposure control with three specific improvements over the
+        basic single-pass version:
 
-        Step 1 — hardware AEC: enable the camera's built-in auto-exposure and drain
-                  frames until the hardware reports a stable ExposureTime in metadata.
-        Step 2 — gain cap: clamp AnalogueGain to limit noise in dark/evening conditions.
-                  If capped, compensate with a proportional exposure increase.
-        Step 3 — lock & verify: disable AEC, drain frames until the locked exposure is
-                  confirmed by metadata, then measure actual brightness.
-        Step 4 — single linear correction: one proportional nudge if brightness is
-                  outside tolerance. Drain frames again to confirm before returning.
-                  Logs a warning if the scene is too dark/bright to reach target.
+        1. LED state-change guard: when LED transitions off→on, AEC's settled value
+           reflects a pitch-dark scene and would massively overshoot. Instead, seed
+           from led_baseline_exposure so AEC re-hunts from a sane starting point.
+
+        2. Darkness override: after AEC settles with LED off, if brightness is still
+           below darkness_threshold the scene is too dark regardless of time schedule
+           (dusk/overcast). Turn the LED on, re-run AEC, and continue — this closes
+           the dusk gap without requiring TOML schedule edits.
+
+        3. Multi-pass correction (up to max_correction_passes): each pass applies a
+           proportional nudge and drains frames until metadata confirms the new exposure
+           before re-measuring. Stops as soon as brightness is within tolerance.
         """
         if not self.auto_exposure:
             return self.get_current_exposure_time()
@@ -509,21 +552,23 @@ class DataRecorder():
 
         try:
             if platform.system() == "Linux" and hasattr(self, 'picam2'):
-                # --- Step 1: let hardware AEC settle, confirmed by metadata ---
-                self.picam2.set_controls({'AeEnable': True})
-                # Drain frames while AEC is still hunting; stop when ExposureTime
-                # is stable (two consecutive reads within tolerance of each other).
-                prev_exposure = 0
-                for _ in range(20):
-                    self.picam2.capture_array("main")  # discard
-                    meta = self.picam2.capture_metadata()
-                    curr = meta.get('ExposureTime', 0)
-                    if abs(curr - prev_exposure) < 2000:  # stable
-                        break
-                    prev_exposure = curr
-                exposure_time = meta['ExposureTime']
-                gain = meta.get('AnalogueGain', 1.0)
-                print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
+                led_just_turned_on = led_used and not self.last_led_state
+
+                # --- Step 1: AEC settle (with LED state-change guard) ---
+                if led_just_turned_on:
+                    # AEC's value from the dark period would cause massive overshoot.
+                    # Jump straight to the known-good LED baseline and let AEC re-hunt.
+                    exposure_time = self.led_baseline_exposure
+                    gain = 1.0
+                    print(f"LED off→on transition: seeding from baseline {exposure_time} μs (skipping dark AEC value)")
+                    self.picam2.set_controls({
+                        'AeEnable': False,
+                        'ExposureTime': exposure_time,
+                        'AnalogueGain': gain,
+                    })
+                else:
+                    exposure_time, gain = self._run_aec_settle()
+                    print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
 
                 # --- Step 2: cap analogue gain to limit noise ---
                 if gain > self.max_analogue_gain:
@@ -536,7 +581,7 @@ class DataRecorder():
 
                 exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
 
-                # --- Step 3: lock AEC and wait for pipeline to confirm the setting ---
+                # --- Step 3: lock and verify initial brightness ---
                 self.picam2.set_controls({
                     'AeEnable': False,
                     'ExposureTime': exposure_time,
@@ -546,34 +591,60 @@ class DataRecorder():
                 if frame is None:
                     return exposure_time
 
-                test_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                metrics = self.calculate_image_quality(test_bgr)
+                metrics = self.calculate_image_quality(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                 brightness = metrics['avg_brightness']
                 contrast = metrics['contrast_ratio']
+                self.last_measured_brightness = brightness
                 print(f"Verification: brightness={brightness:.1f} "
                       f"(target={self.target_brightness}±{self.brightness_tolerance}), contrast={contrast:.1f}")
 
-                # --- Step 4: single linear correction, confirmed by metadata drain ---
-                if abs(brightness - self.target_brightness) > self.brightness_tolerance:
-                    correction = self.target_brightness / max(1.0, brightness)
-                    correction = max(0.5, min(correction, 2.0))  # dampen to avoid overshoot
-                    corrected_exposure = int(exposure_time * correction)
-                    corrected_exposure = max(self.min_exposure, min(self.max_exposure, corrected_exposure))
-                    print(f"Brightness correction: {exposure_time} → {corrected_exposure} μs (factor={correction:.2f})")
-                    self.picam2.set_controls({'ExposureTime': corrected_exposure})
-                    exposure_time = corrected_exposure
+                # --- Darkness override: scene too dark with LED off → turn LED on and re-run ---
+                if not led_used and self.use_led and brightness < self.darkness_threshold:
+                    print(f"Darkness override: brightness {brightness:.1f} < {self.darkness_threshold}, forcing LED on")
+                    led_used = self.led_on()
+                    if led_used:
+                        time.sleep(0.5)
+                        # Start AEC from the current (dark) exposure clamped to baseline
+                        # so it doesn't have to climb from a high value
+                        seed = min(exposure_time, self.led_baseline_exposure)
+                        self.picam2.set_controls({'AeEnable': False, 'ExposureTime': seed})
+                        exposure_time, gain = self._run_aec_settle()
+                        if gain > self.max_analogue_gain:
+                            exposure_time = min(int(exposure_time * (gain / self.max_analogue_gain)), self.max_exposure)
+                            gain = self.max_analogue_gain
+                        exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
+                        self.picam2.set_controls({'AeEnable': False, 'ExposureTime': exposure_time, 'AnalogueGain': gain})
+                        frame, _ = self._drain_to_exposure(exposure_time)
+                        if frame is not None:
+                            metrics = self.calculate_image_quality(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                            brightness = metrics['avg_brightness']
+                            contrast = metrics['contrast_ratio']
+                            self.last_measured_brightness = brightness
+                            print(f"Post-LED-override AEC: exposure={exposure_time} μs, brightness={brightness:.1f}")
 
-                    # Drain until the corrected exposure is confirmed, then measure
-                    check_frame, _ = self._drain_to_exposure(corrected_exposure)
-                    if check_frame is not None:
-                        check_bgr = cv2.cvtColor(check_frame, cv2.COLOR_RGB2BGR)
-                        check_metrics = self.calculate_image_quality(check_bgr)
-                        brightness = check_metrics['avg_brightness']
-                        contrast = check_metrics['contrast_ratio']
-                        print(f"Post-correction brightness={brightness:.1f}")
-                        if abs(brightness - self.target_brightness) > self.brightness_tolerance * 2:
-                            print(f"Warning: brightness {brightness:.1f} still outside target — "
-                                  f"scene may be too dark/bright for current LED/exposure limits")
+                # --- Step 4: multi-pass brightness correction (drain-confirmed each pass) ---
+                for pass_num in range(self.max_correction_passes):
+                    if abs(brightness - self.target_brightness) <= self.brightness_tolerance:
+                        break
+                    correction = self.target_brightness / max(1.0, brightness)
+                    correction = max(0.5, min(2.0, correction))
+                    new_exposure = max(self.min_exposure,
+                                      min(self.max_exposure, int(exposure_time * correction)))
+                    print(f"Correction pass {pass_num+1}: {exposure_time} → {new_exposure} μs (factor={correction:.2f})")
+                    self.picam2.set_controls({'ExposureTime': new_exposure})
+                    exposure_time = new_exposure
+                    check_frame, _ = self._drain_to_exposure(new_exposure)
+                    if check_frame is None:
+                        break
+                    metrics = self.calculate_image_quality(cv2.cvtColor(check_frame, cv2.COLOR_RGB2BGR))
+                    brightness = metrics['avg_brightness']
+                    contrast = metrics['contrast_ratio']
+                    self.last_measured_brightness = brightness
+                    print(f"Pass {pass_num+1} result: brightness={brightness:.1f}")
+
+                if abs(brightness - self.target_brightness) > self.brightness_tolerance * 2:
+                    print(f"Warning: brightness {brightness:.1f} outside target after "
+                          f"{self.max_correction_passes} correction passes — scene limits reached")
 
             else:
                 exposure_time = base_exposure
@@ -581,10 +652,10 @@ class DataRecorder():
                 contrast = 1.0
 
             self.log_exposure_data(base_exposure, exposure_time, brightness, contrast, led_used)
-
             self.recent_exposures.append(exposure_time)
             if len(self.recent_exposures) > self.max_exposure_history:
                 self.recent_exposures.pop(0)
+            self.last_led_state = led_used
 
             return exposure_time
 
