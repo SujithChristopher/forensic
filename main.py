@@ -28,7 +28,7 @@ class DataRecorder():
         self.auto_exposure = auto_exposure
         
         # Target brightness level for auto-exposure (0-255)
-        self.target_brightness = 180  # Medium brightness
+        self.target_brightness = 130  # Medium brightness
         
         # Brightness tolerance (how close we need to get to target)
         self.brightness_tolerance = 20  # Tighter tolerance for more uniform results
