@@ -6,6 +6,7 @@ import platform
 import csv
 import tomli  # For reading TOML files
 import numpy as np
+import threading
 from datetime import datetime
 os.environ['LIBCAMERA_LOG_LEVELS'] = '4'
 
@@ -47,9 +48,12 @@ class DataRecorder():
         # AEC settle time (seconds) — how long to wait for hardware auto-exposure to stabilise
         self.aec_settle_time = 2.0
 
-        # If scene brightness drops below this (0-255) and LED is available, turn it on
-        # regardless of the time-based schedule — handles dusk/overcast gaps
-        self.darkness_threshold = 50
+        # LED darkness override with hysteresis to avoid dusk/dawn oscillation:
+        # turn the LED on when ambient (LED-off) brightness drops below led_on_threshold,
+        # and only drop back to LED-off once ambient climbs back above led_off_threshold.
+        # The gap between the two prevents minute-to-minute flip-flopping near the boundary.
+        self.led_on_threshold = 50
+        self.led_off_threshold = 85
 
         # When LED transitions off→on, AEC's settled value is from a dark scene and causes
         # massive overshoot. Use this conservative baseline instead and let AEC re-hunt.
@@ -58,12 +62,31 @@ class DataRecorder():
         # Track LED state across captures to detect off→on transitions
         self.last_led_state = False
 
-        # Last brightness measured during exposure calibration — used by should_use_led()
-        # to trigger the darkness override on the next capture cycle
+        # Last brightness measured during exposure calibration (may be LED-lit).
         self.last_measured_brightness = None
+
+        # Last ambient (LED-off) brightness — drives the LED hysteresis in should_use_led().
+        # Measured fresh every capture cycle before the LED is switched on.
+        self.last_ambient_brightness = None
 
         # Max brightness correction passes per capture (each drain-confirmed)
         self.max_correction_passes = 3
+
+        # Temporal exposure smoothing: blend each new exposure with recent history and
+        # rate-limit the per-capture change so brightness doesn't flicker minute-to-minute.
+        self.exposure_smoothing = 0.6   # weight of the freshly-measured exposure (0-1)
+        self.max_exposure_step = 2.0    # max multiplicative change vs. the last exposure
+
+        # Low-resolution metering stream size — used for all auto-exposure test frames so
+        # the pipeline isn't churning 4608x2592 buffers during the hunt (only the final
+        # saved image is full resolution). Set True once the lores stream is configured.
+        self.meter_size = (1920, 1080)
+        self.has_lores = False
+
+        # Concurrency: image capture runs on its own thread so multi-second night
+        # exposures don't stall the 1-second temperature logging loop.
+        self._stop_event = threading.Event()
+        self._paths_lock = threading.Lock()
 
         # Load camera settings from TOML file
         # If no config_file is passed, look for "exposure.toml" in the script's directory
@@ -247,12 +270,13 @@ class DataRecorder():
         if not self.use_led:
             return False
 
-        # Darkness override: if the previous cycle measured very low brightness,
-        # force LED on now regardless of the time schedule. Covers dusk/overcast gaps
-        # where it gets dark before the configured night start hour.
-        if (self.last_measured_brightness is not None
-                and self.last_measured_brightness < self.darkness_threshold):
-            return True
+        # Darkness override with hysteresis: base the decision on ambient (LED-off)
+        # brightness. Once the LED is engaged it stays on until ambient rises well above
+        # the turn-on point, preventing dusk/dawn flip-flopping around a single threshold.
+        if self.last_ambient_brightness is not None:
+            threshold = self.led_off_threshold if self.last_led_state else self.led_on_threshold
+            if self.last_ambient_brightness < threshold:
+                return True
 
         if self.night_led_only:
             return self.is_night_time()
@@ -291,13 +315,16 @@ class DataRecorder():
             
             self.config = self.picam2.create_still_configuration(
                 {"size": self.frame_size},
+                lores={"size": self.meter_size},
                 controls={"ExposureTime": exposure_time},
                 transform=libcamera.Transform(vflip=1),
             )
             self.picam2.configure(self.config)
             self.picam2.start()
             self.picam2.set_controls({'AfMode': 0, 'LensPosition': 0.0})
-            print(f"PiCamera initialized with exposure time: {exposure_time}, lens position: 0 (infinity)")
+            self.has_lores = True
+            print(f"PiCamera initialized with exposure time: {exposure_time}, "
+                  f"lores metering stream: {self.meter_size}, lens position: 0 (infinity)")
         except Exception as e:
             print(f"Error initializing Raspberry Pi camera: {e}")
             print("Falling back to regular camera...")
@@ -488,17 +515,74 @@ class DataRecorder():
                 'contrast_ratio': 0
             }
     
-    def _drain_to_exposure(self, target_exposure, tolerance=2000, max_frames=10):
+    def _relative_tolerance(self, target_exposure):
+        """Frame-settle tolerance scaled to the exposure. A fixed 2000 μs tolerance is
+        far too tight at multi-second night exposures (it never settles) and needlessly
+        loose in daylight. 5% (floored at 2000 μs) works across the whole 24h range."""
+        return max(2000, int(0.05 * abs(target_exposure)))
+
+    def _meter_gray(self):
+        """Capture a low-resolution grayscale frame for brightness metering.
+
+        Uses the dedicated lores stream (YUV420 — the luma plane is a ready-made
+        grayscale image) so the auto-exposure hunt never touches full-resolution
+        buffers. Falls back to the main stream if lores is unavailable.
+        """
+        if self.has_lores:
+            try:
+                arr = self.picam2.capture_array("lores")
+                w, h = self.meter_size
+                if arr.ndim == 3:
+                    # Some pipelines hand back an RGB lores buffer instead of YUV420.
+                    return cv2.cvtColor(arr[:h, :w], cv2.COLOR_RGB2GRAY)
+                # YUV420: the first h rows are the luma (brightness) plane.
+                return arr[:h, :w]
+            except Exception as e:
+                print(f"lores metering failed ({e}); falling back to main stream")
+        frame = self.picam2.capture_array("main")
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+    def _ambient_brightness(self):
+        """Mean brightness of the current scene with the LED off (ambient light only).
+        Drives the LED hysteresis. Assumes the caller has not yet switched the LED on."""
+        try:
+            gray = self._meter_gray()
+            return float(np.mean(gray))
+        except Exception as e:
+            print(f"Error measuring ambient brightness: {e}")
+            return None
+
+    def _smooth_exposure(self, new_exposure):
+        """Blend a freshly-measured exposure with recent history and rate-limit the
+        per-capture change. Removes the minute-to-minute brightness flicker caused by
+        the auto-exposure hunt re-deciding from scratch each cycle, while still tracking
+        genuine light-level trends over a few captures."""
+        if not self.recent_exposures:
+            return new_exposure
+        last = self.recent_exposures[-1]
+        # Rate-limit relative to the last applied exposure.
+        lo = last / self.max_exposure_step
+        hi = last * self.max_exposure_step
+        stepped = max(lo, min(hi, new_exposure))
+        # Exponential blend against the recent median (robust to a single outlier).
+        ref = float(np.median(self.recent_exposures))
+        smoothed = self.exposure_smoothing * stepped + (1.0 - self.exposure_smoothing) * ref
+        return int(max(self.min_exposure, min(self.max_exposure, smoothed)))
+
+    def _drain_to_exposure(self, target_exposure, tolerance=None, max_frames=8):
         """
         Discard frames until capture_metadata confirms the pipeline is delivering
-        the requested ExposureTime. Returns the last measured frame and its metadata.
-        picamera2 applies set_controls() to a future frame, not the current one, so
-        reading metadata is the only reliable way to know when the setting has landed.
+        the requested ExposureTime. Returns the last measured grayscale frame and its
+        metadata. picamera2 applies set_controls() to a future frame, not the current
+        one, so reading metadata is the only reliable way to know when the setting landed.
+        Metering frames come from the lores stream to keep the hunt cheap.
         """
+        if tolerance is None:
+            tolerance = self._relative_tolerance(target_exposure)
         frame = None
         meta = {}
         for i in range(max_frames):
-            frame = self.picam2.capture_array("main")
+            frame = self._meter_gray()
             meta = self.picam2.capture_metadata()
             actual = meta.get('ExposureTime', 0)
             if abs(actual - target_exposure) <= tolerance:
@@ -515,34 +599,46 @@ class DataRecorder():
         prev_exposure = 0
         meta = {}
         for _ in range(20):
-            self.picam2.capture_array("main")
+            self._meter_gray()
             meta = self.picam2.capture_metadata()
             curr = meta.get('ExposureTime', 0)
-            if abs(curr - prev_exposure) < 2000:
+            if abs(curr - prev_exposure) < self._relative_tolerance(curr):
                 break
             prev_exposure = curr
         return meta.get('ExposureTime', prev_exposure), meta.get('AnalogueGain', 1.0)
 
     def simple_adjust_exposure(self, led_required=False):
         """
-        Hybrid AEC/AGC exposure control with three specific improvements over the
-        basic single-pass version:
+        Hybrid AEC/AGC exposure control with improvements for 24x7 consistency:
 
         1. LED state-change guard: when LED transitions off→on, AEC's settled value
            reflects a pitch-dark scene and would massively overshoot. Instead, seed
            from led_baseline_exposure so AEC re-hunts from a sane starting point.
 
-        2. Darkness override: after AEC settles with LED off, if brightness is still
-           below darkness_threshold the scene is too dark regardless of time schedule
-           (dusk/overcast). Turn the LED on, re-run AEC, and continue — this closes
-           the dusk gap without requiring TOML schedule edits.
+        2. Darkness override with hysteresis: after measuring with LED off, if ambient
+           brightness is below the (hysteretic) darkness threshold the scene is too dark
+           regardless of the time schedule. Turn the LED on, re-run AEC, and continue.
 
         3. Multi-pass correction (up to max_correction_passes): each pass applies a
            proportional nudge and drains frames until metadata confirms the new exposure
            before re-measuring. Stops as soon as brightness is within tolerance.
+
+        4. Temporal smoothing: the final exposure is blended with recent history and
+           rate-limited so brightness doesn't flicker between consecutive captures.
+
+        All metering frames come from the low-resolution lores stream to keep the hunt
+        cheap; only the final saved image is captured at full resolution.
         """
         if not self.auto_exposure:
             return self.get_current_exposure_time()
+
+        # Measure ambient (LED-off) brightness up front — the LED is off at this point
+        # (turned off in the previous cycle's finally block). This feeds the LED
+        # hysteresis so should_use_led() reacts to the *actual* current scene light.
+        if platform.system() == "Linux" and hasattr(self, 'picam2'):
+            ambient = self._ambient_brightness()
+            if ambient is not None:
+                self.last_ambient_brightness = ambient
 
         led_used = False
         if led_required and self.should_use_led():
@@ -592,16 +688,20 @@ class DataRecorder():
                 if frame is None:
                     return exposure_time
 
-                metrics = self.calculate_image_quality(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                metrics = self.calculate_image_quality(frame)
                 brightness = metrics['avg_brightness']
                 contrast = metrics['contrast_ratio']
                 self.last_measured_brightness = brightness
+                if not led_used:
+                    # Still an ambient (LED-off) reading — keep the hysteresis input fresh.
+                    self.last_ambient_brightness = brightness
                 print(f"Verification: brightness={brightness:.1f} "
                       f"(target={self.target_brightness}±{self.brightness_tolerance}), contrast={contrast:.1f}")
 
-                # --- Darkness override: scene too dark with LED off → turn LED on and re-run ---
-                if not led_used and self.use_led and brightness < self.darkness_threshold:
-                    print(f"Darkness override: brightness {brightness:.1f} < {self.darkness_threshold}, forcing LED on")
+                # --- Darkness override (hysteretic): scene too dark with LED off ---
+                dark_thr = self.led_off_threshold if self.last_led_state else self.led_on_threshold
+                if not led_used and self.use_led and brightness < dark_thr:
+                    print(f"Darkness override: brightness {brightness:.1f} < {dark_thr}, forcing LED on")
                     led_used = self.led_on()
                     if led_used:
                         time.sleep(0.5)
@@ -617,7 +717,7 @@ class DataRecorder():
                         self.picam2.set_controls({'AeEnable': False, 'ExposureTime': exposure_time, 'AnalogueGain': gain})
                         frame, _ = self._drain_to_exposure(exposure_time)
                         if frame is not None:
-                            metrics = self.calculate_image_quality(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                            metrics = self.calculate_image_quality(frame)
                             brightness = metrics['avg_brightness']
                             contrast = metrics['contrast_ratio']
                             self.last_measured_brightness = brightness
@@ -637,7 +737,7 @@ class DataRecorder():
                     check_frame, _ = self._drain_to_exposure(new_exposure)
                     if check_frame is None:
                         break
-                    metrics = self.calculate_image_quality(cv2.cvtColor(check_frame, cv2.COLOR_RGB2BGR))
+                    metrics = self.calculate_image_quality(check_frame)
                     brightness = metrics['avg_brightness']
                     contrast = metrics['contrast_ratio']
                     self.last_measured_brightness = brightness
@@ -646,6 +746,19 @@ class DataRecorder():
                 if abs(brightness - self.target_brightness) > self.brightness_tolerance * 2:
                     print(f"Warning: brightness {brightness:.1f} outside target after "
                           f"{self.max_correction_passes} correction passes — scene limits reached")
+
+                # --- Step 5: temporal smoothing to suppress minute-to-minute flicker ---
+                smoothed = self._smooth_exposure(exposure_time)
+                if smoothed != exposure_time:
+                    print(f"Smoothing: {exposure_time} → {smoothed} μs (history {self.recent_exposures})")
+                    self.picam2.set_controls({'ExposureTime': smoothed})
+                    check_frame, _ = self._drain_to_exposure(smoothed)
+                    exposure_time = smoothed
+                    if check_frame is not None:
+                        metrics = self.calculate_image_quality(check_frame)
+                        brightness = metrics['avg_brightness']
+                        contrast = metrics['contrast_ratio']
+                        self.last_measured_brightness = brightness
 
             else:
                 exposure_time = base_exposure
@@ -795,7 +908,27 @@ class DataRecorder():
                 writer.writerow([timestamp] + temp_values)
         except Exception as e:
             print(f"Error logging temperature data: {e}")
-    
+
+    def capture_loop(self):
+        """Dedicated image-capture thread. Runs independently of the temperature loop so
+        multi-second night exposures never stall the 1-second temperature logging.
+
+        The camera is only ever touched from this thread; the temperature loop never
+        accesses it, so no camera lock is needed. The paths lock only serialises the
+        rare day-rollover against an in-progress capture."""
+        next_capture = time.time()  # capture once immediately, then every 60s
+        while not self._stop_event.is_set():
+            if time.time() >= next_capture:
+                try:
+                    with self._paths_lock:
+                        self.capture_image()
+                except Exception as e:
+                    print(f"Error in capture loop: {e}")
+                # Schedule the next capture 60s after this one finished starting.
+                next_capture = time.time() + 60
+            # Wait in short slices so a stop request is handled promptly.
+            self._stop_event.wait(1.0)
+
     def main(self):
         sensor_files = self.initialize_sensors()
         
@@ -819,19 +952,27 @@ class DataRecorder():
             day_end = self.exposure_settings["day"]["end_hour"]
             print(f"\nLED will only be used at night (between {day_end}:00 and {day_start}:00)")
         
+        # Image capture runs on its own thread so long night exposures don't block the
+        # 1-second temperature cadence below.
+        capture_thread = threading.Thread(target=self.capture_loop, name="capture", daemon=True)
+        capture_thread.start()
+
         try:
             while True:
                 try:
                     # Check if we need to update day directory
-                    
+
                     # current_date = datetime.now()
                     # current_day = f"day{(datetime.now() - datetime(2025, 4, 7)).days + 1}"
-                    
+
                     current_day = datetime.now().strftime("%Y-%m-%d")
                     if current_day != self.day_str:
-                        self._update_day_paths()
+                        # Serialise the rollover against an in-progress capture so the
+                        # capture thread never reads half-updated day paths.
+                        with self._paths_lock:
+                            self._update_day_paths()
                         print(f"New day detected. Saving to {self.day_dir}")
-                    
+
                     # Record temperature for all sensors
                     temperatures = []
                     for i, sensor in enumerate(sensor_files):
@@ -843,26 +984,23 @@ class DataRecorder():
                         except Exception as e:
                             print(f"Error reading sensor {i+1}: {e}")
                             temperatures.append(None)
-                    
+
                     # Log all temperatures in one row
                     self.log_temperature(temperatures)
-                    
-                    # Capture image once per minute
-                    current_time = time.time()
-                    if current_time - self.last_image_time >= 60:  # 60 seconds = 1 minute
-                        self.capture_image()
-                        self.last_image_time = current_time
-                    
+
                     print("---")
-                    
+
                 except Exception as e:
                     print(f"Error in main loop: {e}")
                     print("Continuing to next iteration...")
-                
+
                 time.sleep(1)  # 1 second interval
-                
+
         except KeyboardInterrupt:
             print("Recording stopped by user")
+            # Signal the capture thread to stop and wait for it to finish its current frame.
+            self._stop_event.set()
+            capture_thread.join(timeout=15)
             # Ensure LED is off when exiting
             if self.use_led:
                 self.led_off()
