@@ -296,7 +296,8 @@ class DataRecorder():
             )
             self.picam2.configure(self.config)
             self.picam2.start()
-            print(f"PiCamera initialized with exposure time: {exposure_time}")
+            self.picam2.set_controls({'AfMode': 0, 'LensPosition': 0.0})
+            print(f"PiCamera initialized with exposure time: {exposure_time}, lens position: 0 (infinity)")
         except Exception as e:
             print(f"Error initializing Raspberry Pi camera: {e}")
             print("Falling back to regular camera...")
