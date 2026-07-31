@@ -33,3 +33,20 @@ time_exposures = [
 [exposure.day]
 start_hour = 6   # 6 AM
 end_hour = 19    # 7 PM
+
+# Auto-exposure tuning. Only the keys present here override the controller defaults.
+[exposure.auto_exposure]
+target_brightness = 110  # desired frame mean (0-255)
+tolerance = 20
+min_exposure = 5000
+max_exposure = 10000000
+
+# Highlight budget: max % of pixels allowed at/above 250. The LED is an on-axis point
+# source, so at night the frame centre runs ~2.8x the mean and a mean on target can
+# still mean a destroyed centre — the mean cannot detect this, so cap it directly.
+# Measured on recorded data: 0.8% daylight (fine), 1.8% night (acceptable),
+# 4.1-4.7% night (centre gone). Lower = safer highlights, darker surroundings.
+# Keep this above the acceptable 1.8% reading: the LED's specular core stays clipped at
+# any exposure, so a budget below what the scene can physically reach just darkens
+# everything. The controller detects that floor and stops, but a sane budget avoids it.
+max_clip_pct = 2.0

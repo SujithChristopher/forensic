@@ -64,13 +64,21 @@ The system uses a **two-tier exposure control strategy**:
 1. **Time-based baseline exposure**: Configured in [exposure.toml](exposure.toml) with scheduled exposure times throughout the day
 2. **Auto-exposure refinement**: Dynamically adjusts exposure by capturing test frames and analyzing brightness
 
-Both systems work together: time-based provides the starting point, auto-exposure fine-tunes to reach target brightness (default: 180 ± 20 on 0-255 scale).
+Both systems work together: time-based provides the starting point, auto-exposure fine-tunes to reach target brightness (default: 110 ± 20 on 0-255 scale).
 
 The auto-exposure algorithm:
 - Captures lower-resolution test frames (1920x1080) to determine optimal exposure
 - Uses proportional adjustment with dampening to avoid oscillation
 - Maintains exposure history to improve stability
 - Logs all exposure data to CSV for analysis
+
+**Highlights veto brightness.** The LED is an on-axis point source, so at night the frame centre runs ~2.8x the frame mean. Metering on the mean alone cannot see this: a recorded frame measured mean 134 with the centre at 208 and 4% of pixels clipped to white. Auto-exposure therefore also enforces `max_clip_pct` — the share of pixels allowed at/above 250 — and stops short of the brightness target rather than exceed it.
+
+Two outcomes describe this, both normal and both logged:
+- `highlight_limited` — the mean is under target because raising exposure would blow the highlights.
+- `highlight_floor` — reducing exposure has stopped buying meaningful clipping reduction (a specular core stays clipped at any exposure), so the hunt keeps the brighter frame instead of darkening the whole image chasing pixels that cannot be recovered.
+
+Raising `target_brightness` will **not** brighten a night frame in either state. Loosen `max_clip_pct`, or fix the illumination (diffuse the LED, move it off-axis, lower its current) — that is the only real cure for uneven lighting.
 
 ### 3. LED Control with Time-Based Logic
 
@@ -97,10 +105,22 @@ The system expects up to 4 DS18B20 sensors connected via 1-Wire interface:
 
 ### 6. Daily Data Organization
 
-Data is organized in `data/YYYY-MM-DD/` directories with three CSV files per day:
+Data is organized in `data/YYYY-MM-DD/` directories with four CSV files per day:
 - `temp_data_{date}.csv` - Temperature readings (1-second interval)
-- `exposure_data_{date}.csv` - Auto-exposure adjustment logs
-- `image_quality_{date}.csv` - Image quality metrics for each captured image
+- `exposure_data_{date}.csv` - One row per capture: what each stage of the exposure hunt decided, and how it ended (`outcome`)
+- `ae_trace_{date}.csv` - One row per *metering frame*, so a hunt can be replayed rather than inferred
+- `image_quality_{date}.csv` - Metrics for each saved full-resolution image, plus the libcamera metadata of that exact frame
+
+**`capture_id` joins all four image-related records to each other and to the image file.** It is the `YYYYMMDD_HHMMSS` stamp taken *before* the exposure hunt (which can run for tens of seconds at night), so it matches the image filename but not the CSV `timestamp` column.
+
+The schemas are built for post-hoc diagnosis, so they favour what cannot be recovered later. Anything measurable from a saved JPEG (brightness, clipping, hotspot ratio) is logged for convenience; the values that would otherwise be lost forever are the ones that matter:
+- **Analogue/digital gain and `Lux`** — distinguishes "dark because exposure was low" from "noisy because gain was high"
+- **The LED decision path** — `ambient_brightness`, `led_just_turned_on`, `darkness_override`
+- **Every intermediate metering frame** — `ae_trace` records requested vs. actual exposure per frame, so a hunt that failed to settle is visible
+- **`outcome`, `passes_used`, `duration_s`, `error`** — why the hunt stopped, and whether it is eating into the 60-second capture interval
+- **`actual_exposure` vs. `exposure_time`** — what the sensor really used vs. what was requested
+
+Metering happens on the 1920x1080 lores luma stream while the saved image is 4608x2592 from the main stream. Both are logged (`meter_brightness` vs. the image's `avg_brightness`), so any systematic offset between them is measurable rather than assumed.
 
 Images saved as `image_{timestamp}.jpg` (captured every 60 seconds).
 
@@ -147,12 +167,14 @@ Exposure time units: microseconds (μs)
 
 ### Image Quality Metrics
 
-The `calculate_image_quality()` method computes:
-- Average brightness (mean pixel value 0-255)
+`calculate_image_quality()` ([src/image_quality.py](src/image_quality.py)) computes:
+- Average brightness (mean pixel value 0-255), std dev, and percentiles p05/p50/p99
 - Contrast ratio (95th percentile / 5th percentile)
-- Histogram standard deviation (measure of tonal spread)
+- Histogram standard deviation (measure of tonal spread), plus a 16-bin coarse histogram so tone distribution is analysable without re-decoding thousands of JPEGs
+- `clip_pct` — % of pixels at/above 250, i.e. highlight detail lost
+- `center_brightness` / `edge_brightness` / `hotspot_ratio` — the spatial split that reveals uneven LED illumination the mean cannot show
 
-These metrics are logged to CSV and used by auto-exposure to determine if target brightness is achieved.
+These are logged to CSV and used by auto-exposure to decide whether the target brightness is achievable without destroying the highlights.
 
 ## File Organization
 
@@ -175,13 +197,15 @@ These metrics are logged to CSV and used by auto-exposure to determine if target
 
 1. **Auto-exposure test frames must match final exposure**: The system captures multiple test frames until the actual exposure time matches the requested exposure (within 50μs tolerance). This ensures accurate brightness measurement.
 
-2. **Exposure history stabilizes adjustments**: Recent successful exposures are weighted 70% in determining starting exposure, with time-based schedule weighted 30%. This reduces oscillation in changing light conditions.
+2. **Exposure history stabilizes adjustments**: Recent exposures are median-blended and rate-limited (`_smooth_exposure`) to remove minute-to-minute flicker. Only exposures that respected the highlight budget enter the history — one blown frame would otherwise drag the median up for five captures. Smoothing is also re-measured and reverted if it makes clipping worse than the hunt achieved.
 
 3. **LED warm-up delay**: When LED is used, 0.5 second delay allows LED to reach full brightness before capture.
 
 4. **Error handling**: The main loop continues on exceptions rather than crashing, ensuring continuous operation despite transient errors.
 
-5. **Resource cleanup**: LED is always turned off on exit or exception to prevent GPIO being left in active state.
+5. **Every hunt writes exactly one exposure row**: Failure paths (no metering frame, exceptions) log a row carrying the reason in `outcome`/`error` rather than returning silently. An unexplained gap in the CSV is the hardest kind of fault to diagnose after the fact.
+
+6. **Resource cleanup**: LED is always turned off on exit or exception to prevent GPIO being left in active state.
 
 ## Systemd Service
 
@@ -207,11 +231,14 @@ end_hour = 19
 
 # Optional auto-exposure settings (has defaults if omitted)
 [exposure.auto_exposure]
-target_brightness = 180
+target_brightness = 110
 min_exposure = 5000
 max_exposure = 10000000
 tolerance = 20
+max_clip_pct = 2.0   # highlight budget: max % of pixels allowed at/above 250
 ```
+
+`max_clip_pct` must stay above what the scene can physically reach. Measured reference: 0.8% in daylight, 1.8% on an acceptable LED night frame, 4.1-4.7% on one with the centre destroyed. A budget below the reachable floor just darkens the whole frame; the controller detects that floor and stops (`highlight_floor`), but a sane budget avoids the situation.
 
 **numbers.toml structure:**
 ```toml

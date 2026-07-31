@@ -14,6 +14,26 @@ import cv2
 import numpy as np
 
 
+def summarize_metadata(meta):
+    """Pull the diagnostic fields out of a libcamera metadata dict.
+
+    These are not recoverable from the saved JPEG afterwards, so anything used to
+    reason about a bad capture has to be logged at the time it was taken.
+    """
+    meta = meta or {}
+    colour_gains = meta.get('ColourGains') or (None, None)
+    return {
+        'actual_exposure': meta.get('ExposureTime'),
+        'analogue_gain': meta.get('AnalogueGain'),
+        'digital_gain': meta.get('DigitalGain'),
+        'lux': meta.get('Lux'),
+        'sensor_temperature': meta.get('SensorTemperature'),
+        'frame_duration': meta.get('FrameDuration'),
+        'colour_gain_r': colour_gains[0] if len(colour_gains) > 0 else None,
+        'colour_gain_b': colour_gains[1] if len(colour_gains) > 1 else None,
+    }
+
+
 class Camera:
     def __init__(self, frame_size, meter_size, initial_exposure):
         self.frame_size = frame_size
@@ -99,6 +119,11 @@ class Camera:
         frame = self.picam2.capture_array("main")
         return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
+    def meter_frame(self):
+        """Return (grayscale metering frame, metadata) for the current scene."""
+        gray = self.meter_gray()
+        return gray, self.picam2.capture_metadata()
+
     def meter_brightness(self):
         """Mean brightness of the current scene from a lores metering frame."""
         try:
@@ -149,25 +174,43 @@ class Camera:
     # --------------------------------------------------------------- capture
     def capture_and_save(self, image_path):
         """Capture a full-resolution image, save it to image_path, and return
-        (success, bgr_frame). The returned frame is BGR (ready for cv2 metrics)."""
+        (success, bgr_frame, metadata). The returned frame is BGR (ready for cv2
+        metrics); the metadata describes the frame that was actually saved."""
         if self.is_pi:
-            image_frame = self.picam2.capture_array("main")
+            image_frame, meta = self._capture_main_with_metadata()
             if image_frame is not None:
                 # picamera2 returns RGB; convert to BGR for cv2.imwrite
                 image_frame = cv2.cvtColor(image_frame, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(image_path, image_frame)
-                return True, image_frame
-            return False, None
+                return True, image_frame, meta
+            return False, None, {}
         elif self.cap is not None:
             ret, image_frame = self.cap.read()
             if ret:
                 cv2.imwrite(image_path, image_frame)
-                return True, image_frame
+                return True, image_frame, {}
             print("Warning: Could not capture image")
-            return False, None
+            return False, None, {}
         else:
             print("Warning: No camera available to capture image")
-            return False, None
+            return False, None, {}
+
+    def _capture_main_with_metadata(self):
+        """Capture the main stream together with the metadata of that same frame.
+
+        capture_request() pairs them atomically; reading metadata separately after a
+        capture_array() can describe a later frame, which would silently mislabel the
+        exposure/gain a saved image was taken with.
+        """
+        try:
+            request = self.picam2.capture_request()
+            try:
+                return request.make_array("main"), request.get_metadata()
+            finally:
+                request.release()
+        except Exception as e:
+            print(f"capture_request failed ({e}); falling back to capture_array")
+            return self.picam2.capture_array("main"), self.picam2.capture_metadata()
 
     def close(self):
         if self.cap is not None:

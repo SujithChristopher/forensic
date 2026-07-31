@@ -31,6 +31,7 @@ def default_settings():
             "min_exposure": 5000,
             "max_exposure": 1000000,
             "tolerance": 10,
+            "max_clip_pct": 2.0,
         },
     }
 

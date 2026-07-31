@@ -15,7 +15,22 @@ import time
 
 import numpy as np
 
-from .image_quality import calculate_image_quality
+from .camera import summarize_metadata
+from .image_quality import EMPTY_METRICS, calculate_image_quality
+
+# Metrics carried from every metering frame into the trace CSV.
+TRACE_METRICS = (
+    'avg_brightness', 'clip_pct', 'p99', 'center_brightness',
+    'edge_brightness', 'hotspot_ratio', 'contrast_ratio',
+)
+
+
+class _MeteringFailed(Exception):
+    """A metering frame could not be captured; unwind to the single logging path."""
+
+    def __init__(self, exposure_time):
+        super().__init__(f"no metering frame at {exposure_time} μs")
+        self.exposure_time = exposure_time
 
 
 class ExposureController:
@@ -33,6 +48,19 @@ class ExposureController:
         # --- brightness targets ---
         self.target_brightness = 110       # Medium brightness (0-255)
         self.brightness_tolerance = 20     # How close we need to get to target
+
+        # Highlight budget: max share of pixels allowed at/above CLIP_LEVEL. The LED is
+        # an on-axis point source, so at night the centre runs ~2.8x the frame mean and
+        # a mean on target can still mean a destroyed centre. Measured on recorded data:
+        # 0.8% daylight (fine), 1.8% night (acceptable), 4.1-4.7% night (centre gone).
+        # This vetoes brightness: exposure stops rising once the budget is reached.
+        self.max_clip_pct = 2.0
+
+        # A specular core stays clipped at any exposure, so the budget can be physically
+        # unreachable. Once a reduction pass buys less than this relative improvement in
+        # clipping, stop and keep the brighter exposure rather than darkening the whole
+        # frame forever chasing pixels that will never come back.
+        self.min_clip_improvement = 0.10
 
         # --- exposure bounds (microseconds) ---
         self.min_exposure = 5000
@@ -70,6 +98,10 @@ class ExposureController:
         self.max_exposure_history = 5
         self.last_exposure_time = self.config.get_current_exposure_time()
 
+        # Per-capture decision trace, flushed to CSV at the end of each hunt.
+        self._trace = []
+        self._capture_id = ""
+
         # Apply auto-exposure overrides from the TOML file, if any were present
         overrides = self.config.auto_exposure_overrides
         if overrides:
@@ -81,6 +113,8 @@ class ExposureController:
                 self.max_exposure = overrides["max_exposure"]
             if "tolerance" in overrides:
                 self.brightness_tolerance = overrides["tolerance"]
+            if "max_clip_pct" in overrides:
+                self.max_clip_pct = overrides["max_clip_pct"]
 
     # ------------------------------------------------------------- delegation
     def get_current_exposure_time(self):
@@ -116,8 +150,48 @@ class ExposureController:
         if self.led is not None and self.use_led:
             self.led.off()
 
+    # --------------------------------------------------------- highlight veto
+    def _is_highlight_limited(self, clip_pct):
+        """True when the highlight budget, not the brightness target, is the binding limit."""
+        return clip_pct >= self.max_clip_pct * 0.8
+
+    def _correction_factor(self, brightness, clip_pct):
+        """Exposure multiplier for a measured frame, or None if it is good enough.
+
+        Highlights veto brightness: exposure only rises while clipping stays inside
+        max_clip_pct, and is cut when it does not, however dark the mean looks. Under
+        LED the mean will therefore settle below target on purpose — that is correct,
+        not a failure, and is reported as the 'highlight_limited' outcome.
+        """
+        if clip_pct > self.max_clip_pct:
+            # Clipping is unambiguous, so allow a harder cut than the mean-driven damping.
+            return max((self.max_clip_pct / clip_pct) ** 0.5, 0.4)
+        if abs(brightness - self.target_brightness) <= self.brightness_tolerance:
+            return None
+        if brightness > self.target_brightness:
+            return max(self.target_brightness / max(1.0, brightness), 0.5)
+        if self._is_highlight_limited(clip_pct):
+            return None
+        return min(self.target_brightness / max(1.0, brightness), 2.0)
+
+    def _observe(self, stage, requested, frame, meta, pass_num=0, led_on=False):
+        """Score a metering frame and append it to this capture's decision trace."""
+        metrics = calculate_image_quality(frame) if frame is not None else dict(EMPTY_METRICS)
+        row = {
+            'capture_id': self._capture_id,
+            'stage': stage,
+            'pass_num': pass_num,
+            'requested_exposure': requested,
+            'led_on': led_on,
+            'frame_ok': frame is not None,
+        }
+        row.update(summarize_metadata(meta))
+        row.update({key: metrics[key] for key in TRACE_METRICS})
+        self._trace.append(row)
+        return metrics
+
     # ------------------------------------------------------------- core hunt
-    def simple_adjust_exposure(self, led_required=False):
+    def simple_adjust_exposure(self, led_required=False, capture_id=""):
         """
         Hybrid AEC/AGC exposure control with improvements for 24x7 consistency:
 
@@ -142,13 +216,37 @@ class ExposureController:
         if not self.auto_exposure:
             return self.get_current_exposure_time()
 
+        self._trace = []
+        self._capture_id = capture_id
+        gain = 1.0
+        metrics = dict(EMPTY_METRICS)
+
+        # Diagnostic-only record of how this hunt reached its answer. Kept apart from the
+        # control-flow locals so every branch below contributes to one CSV row.
+        state = {
+            'started': time.time(),
+            'outcome': 'not_pi',
+            'passes_used': 0,
+            'aec_exposure': None,
+            'aec_gain': None,
+            'gain_capped': False,
+            'led_just_turned_on': False,
+            'darkness_override': False,
+            'pre_smoothing_exposure': None,
+            'smoothing_reverted': False,
+            'ambient': None,
+        }
+
         # Measure ambient (LED-off) brightness up front — the LED is off at this point
         # (turned off in the previous cycle's finally block). This feeds the LED
         # hysteresis so should_use_led() reacts to the *actual* current scene light.
         if self.camera.is_pi:
-            ambient = self.camera.meter_brightness()
-            if ambient is not None:
-                self.last_ambient_brightness = ambient
+            ambient_frame, ambient_meta = self.camera.meter_frame()
+            ambient_metrics = self._observe(
+                'ambient', self.last_exposure_time, ambient_frame, ambient_meta)
+            if ambient_frame is not None:
+                state['ambient'] = ambient_metrics['avg_brightness']
+                self.last_ambient_brightness = state['ambient']
 
         led_used = False
         if led_required and self.should_use_led():
@@ -160,6 +258,7 @@ class ExposureController:
         try:
             if self.camera.is_pi:
                 led_just_turned_on = led_used and not self.last_led_state
+                state['led_just_turned_on'] = led_just_turned_on
 
                 # --- Step 1: AEC settle (with LED state-change guard) ---
                 if led_just_turned_on:
@@ -178,6 +277,8 @@ class ExposureController:
                     exposure_time, gain = self.camera.run_aec_settle()
                     print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
 
+                state['aec_exposure'], state['aec_gain'] = exposure_time, gain
+
                 # --- Step 2: cap analogue gain to limit noise ---
                 if gain > self.max_analogue_gain:
                     exposure_time = min(
@@ -185,6 +286,7 @@ class ExposureController:
                         self.max_exposure,
                     )
                     gain = self.max_analogue_gain
+                    state['gain_capped'] = True
                     print(f"Gain capped at {self.max_analogue_gain:.1f}x -> "
                           f"exposure adjusted to {exposure_time} μs")
 
@@ -196,11 +298,15 @@ class ExposureController:
                     'ExposureTime': exposure_time,
                     'AnalogueGain': gain,
                 })
-                frame, _ = self.camera.drain_to_exposure(exposure_time)
+                frame, verify_meta = self.camera.drain_to_exposure(exposure_time)
+                metrics = self._observe('verify', exposure_time, frame, verify_meta,
+                                        led_on=led_used)
                 if frame is None:
-                    return exposure_time
+                    # Log the failure rather than returning silently — an unexplained gap
+                    # in the exposure CSV is the hardest kind of fault to diagnose later.
+                    state['outcome'] = "meter_frame_none"
+                    raise _MeteringFailed(exposure_time)
 
-                metrics = calculate_image_quality(frame)
                 brightness = metrics['avg_brightness']
                 contrast = metrics['contrast_ratio']
                 self.last_measured_brightness = brightness
@@ -209,13 +315,14 @@ class ExposureController:
                     self.last_ambient_brightness = brightness
                 print(f"Verification: brightness={brightness:.1f} "
                       f"(target={self.target_brightness}±{self.brightness_tolerance}), "
-                      f"contrast={contrast:.1f}")
+                      f"contrast={contrast:.1f}, clipped={metrics['clip_pct']:.2f}%")
 
                 # --- Darkness override (hysteretic): scene too dark with LED off ---
                 dark_thr = self.led_off_threshold if self.last_led_state else self.led_on_threshold
                 if not led_used and self.use_led and brightness < dark_thr:
                     print(f"Darkness override: brightness {brightness:.1f} < {dark_thr}, "
                           f"forcing LED on")
+                    state['darkness_override'] = True
                     led_used = self.led_on()
                     if led_used:
                         time.sleep(0.5)
@@ -233,37 +340,84 @@ class ExposureController:
                         self.camera.set_controls({'AeEnable': False,
                                                   'ExposureTime': exposure_time,
                                                   'AnalogueGain': gain})
-                        frame, _ = self.camera.drain_to_exposure(exposure_time)
+                        frame, override_meta = self.camera.drain_to_exposure(exposure_time)
+                        override_metrics = self._observe(
+                            'override_aec', exposure_time, frame, override_meta, led_on=True)
                         if frame is not None:
-                            metrics = calculate_image_quality(frame)
+                            metrics = override_metrics
                             brightness = metrics['avg_brightness']
                             contrast = metrics['contrast_ratio']
                             self.last_measured_brightness = brightness
                             print(f"Post-LED-override AEC: exposure={exposure_time} μs, "
-                                  f"brightness={brightness:.1f}")
+                                  f"brightness={brightness:.1f}, "
+                                  f"clipped={metrics['clip_pct']:.2f}%")
 
-                # --- Step 4: multi-pass brightness correction (drain-confirmed each pass) ---
+                # --- Step 4: multi-pass correction, highlight-vetoed (drain-confirmed) ---
+                state['outcome'] = "passes_exhausted"
                 for pass_num in range(self.max_correction_passes):
-                    if abs(brightness - self.target_brightness) <= self.brightness_tolerance:
+                    over_budget = metrics['clip_pct'] > self.max_clip_pct
+                    prev_exposure, prev_metrics = exposure_time, metrics
+                    correction = self._correction_factor(brightness, metrics['clip_pct'])
+                    if correction is None:
+                        off_target = (abs(brightness - self.target_brightness)
+                                      > self.brightness_tolerance)
+                        state['outcome'] = (
+                            "highlight_limited"
+                            if off_target and self._is_highlight_limited(metrics['clip_pct'])
+                            else "in_tolerance")
                         break
-                    correction = self.target_brightness / max(1.0, brightness)
-                    correction = max(0.5, min(2.0, correction))
                     new_exposure = max(self.min_exposure,
                                        min(self.max_exposure, int(exposure_time * correction)))
+                    if new_exposure == exposure_time:
+                        state['outcome'] = "at_exposure_limit"
+                        break
                     print(f"Correction pass {pass_num+1}: {exposure_time} -> {new_exposure} μs "
                           f"(factor={correction:.2f})")
                     self.camera.set_controls({'ExposureTime': new_exposure})
                     exposure_time = new_exposure
-                    check_frame, _ = self.camera.drain_to_exposure(new_exposure)
+                    state['passes_used'] = pass_num + 1
+                    check_frame, check_meta = self.camera.drain_to_exposure(new_exposure)
+                    check_metrics = self._observe('correction', new_exposure, check_frame,
+                                                  check_meta, pass_num=pass_num + 1,
+                                                  led_on=led_used)
                     if check_frame is None:
+                        state['outcome'] = "correction_frame_none"
                         break
-                    metrics = calculate_image_quality(check_frame)
+                    metrics = check_metrics
+
+                    # Irreducible highlights: this pass darkened the frame without
+                    # meaningfully reducing clipping, so the clipped pixels are a
+                    # specular core that no exposure can recover. Keep the brighter
+                    # frame — chasing them would black out everything else.
+                    if (over_budget
+                            and metrics['clip_pct'] > prev_metrics['clip_pct']
+                            * (1 - self.min_clip_improvement)):
+                        print(f"Highlight floor: clipping {prev_metrics['clip_pct']:.2f}% -> "
+                              f"{metrics['clip_pct']:.2f}% for a "
+                              f"{prev_metrics['avg_brightness']:.1f} -> "
+                              f"{metrics['avg_brightness']:.1f} brightness loss — "
+                              f"reverting to {prev_exposure} μs")
+                        exposure_time = prev_exposure
+                        metrics = prev_metrics
+                        brightness = metrics['avg_brightness']
+                        contrast = metrics['contrast_ratio']
+                        self.camera.set_controls({'ExposureTime': exposure_time})
+                        self.camera.drain_to_exposure(exposure_time)
+                        state['outcome'] = "highlight_floor"
+                        break
+
                     brightness = metrics['avg_brightness']
                     contrast = metrics['contrast_ratio']
                     self.last_measured_brightness = brightness
-                    print(f"Pass {pass_num+1} result: brightness={brightness:.1f}")
+                    print(f"Pass {pass_num+1} result: brightness={brightness:.1f}, "
+                          f"clipped={metrics['clip_pct']:.2f}%")
 
-                if abs(brightness - self.target_brightness) > self.brightness_tolerance * 2:
+                if metrics['clip_pct'] > self.max_clip_pct:
+                    print(f"Warning: clipping {metrics['clip_pct']:.2f}% still over budget "
+                          f"{self.max_clip_pct:.2f}% after {state['passes_used']} pass(es) — "
+                          f"illumination is too uneven to fix with exposure alone")
+                elif (state['outcome'] != "highlight_limited"
+                      and abs(brightness - self.target_brightness) > self.brightness_tolerance * 2):
                     print(f"Warning: brightness {brightness:.1f} outside target after "
                           f"{self.max_correction_passes} correction passes — scene limits reached")
 
@@ -272,34 +426,102 @@ class ExposureController:
                 if smoothed != exposure_time:
                     print(f"Smoothing: {exposure_time} -> {smoothed} μs "
                           f"(history {self.recent_exposures})")
+                    state['pre_smoothing_exposure'] = exposure_time
+                    pre_smoothing_exposure = exposure_time
+                    pre_smoothing_metrics = metrics
                     self.camera.set_controls({'ExposureTime': smoothed})
-                    check_frame, _ = self.camera.drain_to_exposure(smoothed)
+                    check_frame, smooth_meta = self.camera.drain_to_exposure(smoothed)
+                    smooth_metrics = self._observe('smoothing', smoothed, check_frame,
+                                                   smooth_meta, led_on=led_used)
                     exposure_time = smoothed
                     if check_frame is not None:
-                        metrics = calculate_image_quality(check_frame)
+                        metrics = smooth_metrics
                         brightness = metrics['avg_brightness']
                         contrast = metrics['contrast_ratio']
                         self.last_measured_brightness = brightness
+
+                        # Smoothing blends toward history, which can push exposure back up
+                        # past the highlight budget the correction passes just enforced.
+                        # Compare against what the hunt achieved, not just the budget:
+                        # on a scene sitting at its highlight floor the pre-smoothing
+                        # frame is over budget too, and "over budget" alone never fires.
+                        if metrics['clip_pct'] > max(self.max_clip_pct,
+                                                     pre_smoothing_metrics['clip_pct']):
+                            print(f"Smoothing re-clipped ({metrics['clip_pct']:.2f}%) — "
+                                  f"reverting to {pre_smoothing_exposure} μs")
+                            state['smoothing_reverted'] = True
+                            exposure_time = pre_smoothing_exposure
+                            metrics = pre_smoothing_metrics
+                            brightness = metrics['avg_brightness']
+                            contrast = metrics['contrast_ratio']
+                            self.camera.set_controls({'ExposureTime': exposure_time})
+                            self.camera.drain_to_exposure(exposure_time)
 
             else:
                 exposure_time = base_exposure
                 brightness = float(self.target_brightness)
                 contrast = 1.0
 
-            self.storage.log_exposure(base_exposure, exposure_time, brightness, contrast, led_used)
-            self.recent_exposures.append(exposure_time)
-            if len(self.recent_exposures) > self.max_exposure_history:
-                self.recent_exposures.pop(0)
+            # Only feed the smoothing history exposures that respected the highlight
+            # budget — one blown frame would otherwise drag the median up for 5 captures.
+            if metrics['clip_pct'] <= self.max_clip_pct:
+                self.recent_exposures.append(exposure_time)
+                if len(self.recent_exposures) > self.max_exposure_history:
+                    self.recent_exposures.pop(0)
             self.last_led_state = led_used
 
+            self._log_hunt(state, base_exposure, exposure_time, metrics, gain, led_used)
             return exposure_time
 
+        except _MeteringFailed as failure:
+            self.last_led_state = led_used
+            self._log_hunt(state, base_exposure, failure.exposure_time, metrics, gain, led_used)
+            return failure.exposure_time
         except Exception as e:
             print(f"Error during auto-exposure: {e}")
+            state['outcome'] = f"error:{type(e).__name__}"
+            self._log_hunt(state, base_exposure, base_exposure, metrics, gain, led_used,
+                           error=str(e))
             return base_exposure
         finally:
             if led_used:
                 self.led_off()
+
+    def _log_hunt(self, state, schedule_exposure, final_exposure, metrics, gain, led_used,
+                  error=""):
+        """Write the per-capture summary row plus the per-frame decision trace."""
+        record = {
+            'capture_id': self._capture_id,
+            'schedule_exposure': schedule_exposure,
+            'aec_exposure': state['aec_exposure'],
+            'aec_gain': state['aec_gain'],
+            'gain_capped': state['gain_capped'],
+            'analogue_gain': gain,
+            'pre_smoothing_exposure': state['pre_smoothing_exposure'],
+            'smoothing_reverted': state['smoothing_reverted'],
+            'final_exposure': final_exposure,
+            'meter_brightness': metrics['avg_brightness'],
+            'meter_clip_pct': metrics['clip_pct'],
+            'meter_p99': metrics['p99'],
+            'meter_center_brightness': metrics['center_brightness'],
+            'meter_hotspot_ratio': metrics['hotspot_ratio'],
+            'contrast': metrics['contrast_ratio'],
+            'ambient_brightness': state['ambient'],
+            'led_used': led_used,
+            'led_just_turned_on': state['led_just_turned_on'],
+            'darkness_override': state['darkness_override'],
+            'target_brightness': self.target_brightness,
+            'max_clip_pct': self.max_clip_pct,
+            'passes_used': state['passes_used'],
+            'outcome': state['outcome'],
+            'duration_s': round(time.time() - state['started'], 2),
+            'error': error,
+        }
+        try:
+            self.storage.log_exposure(record)
+            self.storage.log_ae_trace(self._trace)
+        except Exception as e:
+            print(f"Error logging exposure data: {e}")
 
     def _smooth_exposure(self, new_exposure):
         """Blend a freshly-measured exposure with recent history and rate-limit the
@@ -318,7 +540,7 @@ class ExposureController:
         smoothed = self.exposure_smoothing * stepped + (1.0 - self.exposure_smoothing) * ref
         return int(max(self.min_exposure, min(self.max_exposure, smoothed)))
 
-    def update_camera_exposure(self):
+    def update_camera_exposure(self, capture_id=""):
         """Update camera exposure settings based on time of day and auto-exposure."""
         if self.camera.is_pi:
             try:
@@ -327,7 +549,7 @@ class ExposureController:
                 if self.auto_exposure:
                     # simple_adjust_exposure locks the exposure and drains frames until
                     # the pipeline confirms it — no extra set_controls needed here.
-                    exposure_time = self.simple_adjust_exposure(led_required)
+                    exposure_time = self.simple_adjust_exposure(led_required, capture_id)
                 else:
                     exposure_time = self.get_current_exposure_time()
                     self.camera.set_controls({'AeEnable': False, 'ExposureTime': exposure_time})

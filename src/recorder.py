@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import datetime
 
-from .camera import Camera
+from .camera import Camera, summarize_metadata
 from .config import ExposureConfig
 from .exposure import ExposureController
 from .image_quality import calculate_image_quality
@@ -77,11 +77,14 @@ class DataRecorder:
     def capture_image(self):
         """Capture and save a full-resolution image with quality logging."""
         try:
+            # This timestamp is taken before the exposure hunt (which can run for tens of
+            # seconds at night), names the image file, and is the capture_id that joins
+            # the exposure, trace and quality CSVs to that file.
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             image_path = os.path.join(self.storage.day_dir, f"image_{timestamp}.jpg")
 
             # Update camera exposure based on time of day and lighting conditions
-            self.exposure.update_camera_exposure()
+            self.exposure.update_camera_exposure(capture_id=timestamp)
 
             # Turn on LED if enabled and conditions are met
             led_used = False
@@ -94,17 +97,21 @@ class DataRecorder:
                 print(f"LED not used for this capture "
                       f"(Nighttime: {is_night}, LED enabled: {self.use_led})")
 
-            success, image_frame = self.camera.capture_and_save(image_path)
+            success, image_frame, meta = self.camera.capture_and_save(image_path)
 
             if led_used:
                 self.exposure.led_off()
 
             if success and image_frame is not None:
                 metrics = calculate_image_quality(image_frame)
-                self.storage.log_image_quality(image_path, metrics, self.exposure.last_exposure_time)
+                self.storage.log_image_quality(
+                    image_path, metrics, self.exposure.last_exposure_time,
+                    capture_id=timestamp, meta=summarize_metadata(meta), led_used=led_used)
                 print(f"Image saved: {image_path} "
                       f"(Exposure: {self.exposure.last_exposure_time} μs, "
-                      f"Brightness: {metrics['avg_brightness']:.1f})")
+                      f"Brightness: {metrics['avg_brightness']:.1f}, "
+                      f"Clipped: {metrics['clip_pct']:.2f}%, "
+                      f"Hotspot: {metrics['hotspot_ratio']:.2f}x)")
 
         except Exception as e:
             print(f"Error capturing image: {e}")
