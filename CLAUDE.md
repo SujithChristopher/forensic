@@ -207,6 +207,24 @@ These are logged to CSV and used by auto-exposure to decide whether the target b
 
 6. **Resource cleanup**: LED is always turned off on exit or exception to prevent GPIO being left in active state.
 
+## Deploying to the Recorders
+
+The two Pis sit on the LAN with no internet, so there is no GitHub in the loop. [deploy.ps1](deploy.ps1) pushes this repository to them directly over SSH.
+
+```powershell
+.\deploy.ps1 -InstallKey      # once per machine: password typed once, key auth after
+.\deploy.ps1 -Setup           # once per Pi: allow pushes into the checked-out branch
+.\deploy.ps1 -Deploy -Restart # every update
+.\deploy.ps1 -Status          # what each Pi is running right now
+```
+
+Defaults: `cmc1@192.168.0.100` and `cmc1@192.168.0.101`, path `Documents/forensic`, service `data-recorder.service`. Override with `-ComputerName`, `-User`, `-RemotePath`, `-Service`.
+
+Key properties:
+- **Only committed code moves.** A push transfers git objects, so `data/`, `secrets.toml`, `venv/` and everything else in .gitignore cannot travel — no risk of overwriting a Pi's recorded data.
+- **Per-rig edits are protected.** The Pis run `receive.denyCurrentBranch=updateInstead`, which refuses to update a dirty working tree. The script checks first and refuses rather than clobbering; `-Stash` overrides, leaving the stash on the Pi. This matters most for `exposure.toml`, which is tuned per rig — after a deploy the script prints each Pi's active `[exposure.auto_exposure]` block.
+- **The push is verified.** It compares the Pi's post-push HEAD to the local commit, because a push can succeed while the checkout stays behind if `-Setup` was never run.
+
 ## Systemd Service
 
 The system is designed to run as `data-recorder.service`. See [START_STOP_SERVICE.md](START_STOP_SERVICE.md) for:
