@@ -64,7 +64,9 @@ The system uses a **two-tier exposure control strategy**:
 1. **Time-based baseline exposure**: Configured in [exposure.toml](exposure.toml) with scheduled exposure times throughout the day
 2. **Auto-exposure refinement**: Dynamically adjusts exposure by capturing test frames and analyzing brightness
 
-Both systems work together: time-based provides the starting point, auto-exposure fine-tunes to reach target brightness (default: 180 ± 20 on 0-255 scale).
+Both systems work together: time-based provides the cold-start point, auto-exposure fine-tunes to reach target brightness (default: 120 ± 10 on 0-255 scale).
+
+**Highlights veto brightness.** The LED is an on-axis point source, so at night the frame centre measures ~2.8x brighter than the corners. Metering on the frame mean alone cannot see that: a mean of 134 was measured with the centre at 208 and 4% of pixels clipped. Auto-exposure therefore also enforces `max_clip_pct` — the share of pixels allowed at/above 250 — and will stop short of the brightness target rather than exceed it ("highlight-limited"). Raising `target_brightness` will *not* brighten a night frame that is already at its clip budget; loosen `max_clip_pct` or fix the illumination instead.
 
 The auto-exposure algorithm:
 - Captures lower-resolution test frames (1920x1080) to determine optimal exposure
@@ -151,8 +153,9 @@ The `calculate_image_quality()` method computes:
 - Average brightness (mean pixel value 0-255)
 - Contrast ratio (95th percentile / 5th percentile)
 - Histogram standard deviation (measure of tonal spread)
+- Clipped-pixel percentage (`clip_pct`, share of pixels at/above 250) and the 99th percentile
 
-These metrics are logged to CSV and used by auto-exposure to determine if target brightness is achieved.
+These metrics are logged to CSV and used by auto-exposure to determine if target brightness is achieved without blowing highlights.
 
 ## File Organization
 
@@ -175,13 +178,15 @@ These metrics are logged to CSV and used by auto-exposure to determine if target
 
 1. **Auto-exposure test frames must match final exposure**: The system captures multiple test frames until the actual exposure time matches the requested exposure (within 50μs tolerance). This ensures accurate brightness measurement.
 
-2. **Exposure history stabilizes adjustments**: Recent successful exposures are weighted 70% in determining starting exposure, with time-based schedule weighted 30%. This reduces oscillation in changing light conditions.
+2. **Exposure history stabilizes adjustments**: The starting exposure is the median of recent accepted exposures when any exist; the time-based schedule is used only as a cold start. The schedule's night values overstate the LED-lit requirement by ~20x (5 s scheduled vs ~300 ms measured), so blending it into a known-good exposure wastes the limited adjustment attempts.
 
-3. **LED warm-up delay**: When LED is used, 0.5 second delay allows LED to reach full brightness before capture.
+3. **Only measured exposures are used**: `auto_adjust` records every exposure it actually captures and returns the best-scoring one. It never returns an adjustment it did not test — doing so previously caused a systematic overshoot (test frames logged brightness 105-117 while the saved image measured 134-139).
 
-4. **Error handling**: The main loop continues on exceptions rather than crashing, ensuring continuous operation despite transient errors.
+4. **LED warm-up delay**: When LED is used, 0.5 second delay allows LED to reach full brightness before capture.
 
-5. **Resource cleanup**: LED is always turned off on exit or exception to prevent GPIO being left in active state.
+5. **Error handling**: The main loop continues on exceptions rather than crashing, ensuring continuous operation despite transient errors.
+
+6. **Resource cleanup**: LED is always turned off on exit or exception to prevent GPIO being left in active state.
 
 ## Systemd Service
 
@@ -207,10 +212,11 @@ end_hour = 19
 
 # Optional auto-exposure settings (has defaults if omitted)
 [exposure.auto_exposure]
-target_brightness = 180
+target_brightness = 120
 min_exposure = 5000
-max_exposure = 10000000
-tolerance = 20
+max_exposure = 1000000
+tolerance = 10
+max_clip_pct = 1.0   # max % of pixels allowed at/above 250 (highlight budget)
 ```
 
 **numbers.toml structure:**

@@ -5,7 +5,10 @@
       "Bash(python -m py_compile src/hardware/led.py)",
       "Bash(python -m py_compile src/hardware/camera.py)",
       "Bash(python -m py_compile src/hardware/sensors.py)",
-      "Bash(python -m py_compile src/exposure.py)"
+      "Bash(python -m py_compile src/exposure.py)",
+      "Bash(python -c \"from src.recorder import DataRecorder; print\\(''Import OK''\\)\")",
+      "Bash(python -c \"import sys; print\\(sys.executable, sys.version\\)\")",
+      "Bash(where python:*)"
     ]
   }
 }

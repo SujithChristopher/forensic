@@ -19,6 +19,7 @@ DEFAULT_SETTINGS = {
         "min_exposure": 5000,
         "max_exposure": 1000000,
         "tolerance": 10,
+        "max_clip_pct": 1.0,
     },
 }
 

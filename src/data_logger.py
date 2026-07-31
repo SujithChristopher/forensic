@@ -39,13 +39,13 @@ class DataLogger:
         if not os.path.exists(self.exposure_csv):
             with open(self.exposure_csv, "w", newline="") as f:
                 csv.writer(f).writerow(
-                    ["timestamp", "initial_exposure", "final_exposure", "avg_brightness", "contrast", "led_used"]
+                    ["timestamp", "initial_exposure", "final_exposure", "avg_brightness", "contrast", "clip_pct", "led_used"]
                 )
 
         if not os.path.exists(self.quality_csv):
             with open(self.quality_csv, "w", newline="") as f:
                 csv.writer(f).writerow(
-                    ["timestamp", "filename", "avg_brightness", "contrast", "histogram_std", "exposure_time"]
+                    ["timestamp", "filename", "avg_brightness", "contrast", "histogram_std", "clip_pct", "exposure_time"]
                 )
 
     def log_temperature(self, temperatures):
@@ -58,14 +58,20 @@ class DataLogger:
         except Exception as e:
             print(f"Error logging temperature data: {e}")
 
-    def log_exposure(self, initial, final, brightness, contrast, led_used):
+    def log_exposure(self, initial, final, metrics, led_used):
         """Append one exposure adjustment record to the daily exposure CSV."""
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.exposure_csv, "a", newline="") as f:
-                csv.writer(f).writerow(
-                    [timestamp, initial, final, f"{brightness:.1f}", f"{contrast:.1f}", led_used]
-                )
+                csv.writer(f).writerow([
+                    timestamp,
+                    initial,
+                    final,
+                    f"{metrics['avg_brightness']:.1f}",
+                    f"{metrics['contrast_ratio']:.1f}",
+                    f"{metrics['clip_pct']:.2f}",
+                    led_used,
+                ])
         except Exception as e:
             print(f"Error logging exposure data: {e}")
 
@@ -81,6 +87,7 @@ class DataLogger:
                     f"{metrics['avg_brightness']:.1f}",
                     f"{metrics['contrast_ratio']:.1f}",
                     f"{metrics['hist_std']:.1f}",
+                    f"{metrics['clip_pct']:.2f}",
                     exposure_time,
                 ])
         except Exception as e:

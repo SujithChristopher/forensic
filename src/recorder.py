@@ -58,12 +58,12 @@ class DataRecorder:
         led = self._active_led()
 
         if self.auto_exposure:
-            initial, final, brightness, contrast, led_used = self.exposure_mgr.auto_adjust(
+            initial, final, metrics, led_used = self.exposure_mgr.auto_adjust(
                 self.camera, led=led, recent_history=self.recent_exposures
             )
-            self.logger.log_exposure(initial, final, brightness, contrast, led_used)
+            self.logger.log_exposure(initial, final, metrics, led_used)
 
-            if abs(brightness - self.exposure_mgr.target_brightness) <= self.exposure_mgr.tolerance * 1.5:
+            if self.exposure_mgr.is_acceptable(metrics):
                 self.recent_exposures.append(final)
                 if len(self.recent_exposures) > self.max_exposure_history:
                     self.recent_exposures.pop(0)

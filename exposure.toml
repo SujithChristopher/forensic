@@ -33,3 +33,15 @@ time_exposures = [
 [exposure.day]
 start_hour = 6   # 6 AM
 end_hour = 19    # 7 PM
+
+[exposure.auto_exposure]
+target_brightness = 120  # desired frame mean (0-255)
+tolerance = 10
+min_exposure = 5000
+max_exposure = 1000000
+
+# Highlight budget: max % of pixels allowed at/above 250. This caps the blown-out
+# centre the LED creates at night, which the frame mean cannot detect.
+# Measured reference: 0.8% daylight (fine), 1.8% f1 night (acceptable),
+# 4.1-4.7% f2 night (centre destroyed). Lower = safer highlights, darker surround.
+max_clip_pct = 1.0
