@@ -7,3 +7,4 @@ dist
 build
 code_red.py
 secrets.toml
+.env

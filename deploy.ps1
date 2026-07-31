@@ -56,6 +56,7 @@ param(
 
     [Parameter(ParameterSetName = 'Deploy')][switch]$Restart,
     [Parameter(ParameterSetName = 'Deploy')][switch]$Stash,
+    [Parameter(ParameterSetName = 'Deploy')][switch]$ShowDiff,
     [switch]$DryRun
 )
 
@@ -98,6 +99,70 @@ function Get-RemoteQuoted {
     "'" + $Value.Replace("'", "'\''") + "'"
 }
 
+function Set-PiRemote {
+    <#
+        Register each Pi as a named git remote and return its name.
+
+        Named remotes give us remote-tracking refs, which ad-hoc push URLs do not. That
+        makes `git fetch pi-100` and friends work by hand, and it is what any lease-based
+        push would need. Idempotent: safe to call on every deploy.
+    #>
+    param([Parameter(Mandatory)][string]$ComputerName)
+
+    $name = "pi-" + ($ComputerName -split '\.')[-1]
+    $url = "${User}@${ComputerName}:$RemotePath"
+
+    $current = & git remote get-url $name 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        & git remote add $name $url | Out-Null
+        Write-Step "Added git remote '$name' -> $url"
+    } elseif ($current.Trim() -ne $url) {
+        & git remote set-url $name $url | Out-Null
+        Write-Step "Updated git remote '$name' -> $url"
+    }
+    return $name
+}
+
+function Initialize-SshAgent {
+    <#
+        Load the SSH key into ssh-agent so a passphrase-protected key is unlocked once
+        per boot instead of once per SSH call. Without this a single deploy asks for the
+        passphrase four or five times.
+    #>
+    if (-not (Get-Command ssh-add -ErrorAction SilentlyContinue)) { return }
+
+    $agent = Get-Service ssh-agent -ErrorAction SilentlyContinue
+    if (-not $agent) { return }
+
+    if ($agent.Status -ne 'Running') {
+        try {
+            Start-Service ssh-agent -ErrorAction Stop
+            Write-Step "Started ssh-agent"
+        } catch {
+            Write-Warn "ssh-agent is not running and could not be started without admin rights."
+            Write-Warn "In an elevated PowerShell, once: Set-Service ssh-agent -StartupType Automatic; Start-Service ssh-agent"
+            return
+        }
+    }
+
+    # Load *every* local key, not just the first one found. ssh offers keys in its own
+    # order (ed25519 before rsa), so having only one of them in the agent still produces
+    # passphrase prompts for the other.
+    $loaded = (& ssh-add -l 2>&1 | Out-String)
+
+    foreach ($name in @('id_ed25519', 'id_rsa')) {
+        $privateKey = Join-Path $env:USERPROFILE ".ssh\$name"
+        if (-not (Test-Path $privateKey)) { continue }
+
+        $fingerprint = (& ssh-keygen -lf "$privateKey.pub" 2>$null) -split ' ' | Select-Object -Index 1
+        if ($fingerprint -and $loaded -match [regex]::Escape($fingerprint)) { continue }
+
+        Write-Step "Unlocking $name — passphrase asked once, then cached until reboot"
+        & ssh-add $privateKey
+        if ($LASTEXITCODE -eq 0) { Write-Ok "$name loaded into ssh-agent" }
+    }
+}
+
 # ------------------------------------------------------------------- preflight
 
 if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
@@ -130,6 +195,8 @@ Write-Host "Targets    : $($ComputerName -join ', ') (as $User)"
 Write-Host "Action     : $action$(if ($DryRun) { '  [dry run]' })"
 Write-Host ""
 
+Initialize-SshAgent
+
 if ($action -eq 'Deploy') {
     $dirty = & git status --porcelain
     if ($dirty) {
@@ -141,17 +208,18 @@ if ($action -eq 'Deploy') {
 
 # --------------------------------------------------------------------- actions
 
-function Get-LocalPublicKey {
+function Get-LocalPublicKeys {
     <#
-        Return the path to a public key, generating one if this machine has none.
-        The key is what removes the password prompts; it is never sent anywhere but
-        the Pis' authorized_keys, and the private half never leaves this machine.
+        Return every local public key, generating one if this machine has none.
+        All of them get installed: ssh picks which to offer, and installing only one
+        leaves the other producing prompts. The private halves never leave this machine.
     #>
     $sshDir = Join-Path $env:USERPROFILE '.ssh'
-    foreach ($name in @('id_ed25519.pub', 'id_rsa.pub')) {
+    $found = @(foreach ($name in @('id_ed25519.pub', 'id_rsa.pub')) {
         $candidate = Join-Path $sshDir $name
-        if (Test-Path $candidate) { return $candidate }
-    }
+        if (Test-Path $candidate) { $candidate }
+    })
+    if ($found.Count -gt 0) { return $found }
 
     Write-Step "No SSH key on this machine — generating one"
     if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir | Out-Null }
@@ -164,28 +232,40 @@ function Get-LocalPublicKey {
     }
 
     Write-Ok "Generated $keyFile"
-    return "$keyFile.pub"
+    return @("$keyFile.pub")
 }
 
 function Invoke-InstallKey {
     param([string]$Target)
 
-    $keyPath = Get-LocalPublicKey
-    if (-not $keyPath) { return $false }
+    $keyPaths = Get-LocalPublicKeys
+    if (-not $keyPaths) { return $false }
 
-    Write-Step "Installing $(Split-Path $keyPath -Leaf) — enter the Pi's password once when asked"
-    if ($DryRun) { Write-Ok "would install key"; return $true }
+    $names = ($keyPaths | ForEach-Object { Split-Path $_ -Leaf }) -join ', '
+    Write-Step "Installing $names — enter the Pi's password once when asked"
+    if ($DryRun) { Write-Ok "would install: $names"; return $true }
 
-    $publicKey = (Get-Content $keyPath -Raw).Trim()
-    $install = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && " +
-               "touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && " +
-               "grep -qxF '$publicKey' ~/.ssh/authorized_keys || echo '$publicKey' >> ~/.ssh/authorized_keys"
+    # Append every key in one SSH call, so the password is typed once, not once per key.
+    $commands = @('mkdir -p ~/.ssh', 'chmod 700 ~/.ssh',
+                  'touch ~/.ssh/authorized_keys', 'chmod 600 ~/.ssh/authorized_keys')
+    foreach ($keyPath in $keyPaths) {
+        $publicKey = (Get-Content $keyPath -Raw).Trim()
+        $commands += "grep -qxF '$publicKey' ~/.ssh/authorized_keys || echo '$publicKey' >> ~/.ssh/authorized_keys"
+    }
 
-    # No -o BatchMode here: this is the one call that must be able to ask for a password.
-    & ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target $install
+    # No BatchMode here: this is the one call that must be able to ask for a password.
+    & ssh -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new $Target ($commands -join ' && ')
     if ($LASTEXITCODE -ne 0) { Write-Fail "Key install failed (exit $LASTEXITCODE)"; return $false }
 
-    Write-Ok "Key installed"
+    # Prove it worked, rather than reporting success on an untested assumption.
+    & ssh -o BatchMode=yes -o ConnectTimeout=8 $Target 'true' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Fail "Key installed but passwordless login still fails."
+        Write-Fail "Check permissions on the Pi: ls -ld ~/.ssh ~/.ssh/authorized_keys"
+        return $false
+    }
+
+    Write-Ok "Passwordless login working"
     return $true
 }
 
@@ -211,6 +291,7 @@ function Invoke-Setup {
     if (-not $result.Success) { Write-Fail "Configure failed: $($result.Output)"; return $false }
 
     Write-Ok "Configured to accept pushes (receive.denyCurrentBranch=$($result.Output))"
+    Set-PiRemote -ComputerName ($Target -split '@')[-1] | Out-Null
     return $true
 }
 
@@ -272,8 +353,19 @@ function Invoke-Deploy {
     if ($check.Output) {
         Write-Warn "Uncommitted changes on the Pi:"
         $check.Output -split "`n" | ForEach-Object { Write-Warn "    $_" }
+
+        if ($ShowDiff) {
+            $diff = Invoke-Remote -Target $Target -Command "cd $remoteQuotedPath && git --no-pager diff --stat && git --no-pager diff"
+            Write-Host ""
+            Write-Host ($diff.Output) -ForegroundColor DarkYellow
+            Write-Host ""
+        }
+
         if (-not $Stash) {
-            Write-Fail "Refusing to overwrite. Commit them on the Pi, or re-run with -Stash."
+            Write-Fail "Refusing to overwrite. Options:"
+            Write-Fail "  see them   : .\deploy.ps1 -Deploy -ComputerName $ComputerName -ShowDiff"
+            Write-Fail "  keep them  : commit on the Pi, then deploy again"
+            Write-Fail "  set aside  : re-run with -Stash (recoverable on the Pi via git stash pop)"
             return $false
         }
         if (-not $DryRun) {
@@ -286,11 +378,19 @@ function Invoke-Deploy {
 
     if ($DryRun) { Write-Ok "would push $Branch to ${ComputerName}:$RemotePath"; return $true }
 
-    Write-Step "Pushing $Branch ..."
-    & git push --force-with-lease "${User}@${ComputerName}:$RemotePath" "${Branch}:${Branch}"
+    $remoteName = Set-PiRemote -ComputerName $ComputerName
+
+    Write-Step "Pushing $Branch to remote '$remoteName' ..."
+    # Plain fast-forward push, deliberately not --force-with-lease: the lease needs a
+    # remote-tracking ref to compare against, and it refuses with "stale info" whenever
+    # one is missing. Fast-forward-only is the safer rule for a deploy anyway — if the
+    # Pi has commits we don't, that must be resolved by hand, not overwritten.
+    & git push $remoteName "${Branch}:${Branch}"
     if ($LASTEXITCODE -ne 0) {
         Write-Fail "Push failed (exit $LASTEXITCODE)."
-        Write-Fail "If it mentions denyCurrentBranch, run: .\deploy.ps1 -Setup"
+        Write-Fail "  'denyCurrentBranch'      -> run: .\deploy.ps1 -Setup"
+        Write-Fail "  'non-fast-forward'       -> the Pi has commits you don't have. Inspect with:"
+        Write-Fail "                              git fetch $remoteName; git log --oneline HEAD..$remoteName/$Branch"
         return $false
     }
 
