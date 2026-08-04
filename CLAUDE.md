@@ -195,11 +195,15 @@ These are logged to CSV and used by auto-exposure to decide whether the target b
 
 ## Important Implementation Notes
 
-1. **Auto-exposure test frames must match final exposure**: The system captures multiple test frames until the actual exposure time matches the requested exposure (within 50μs tolerance). This ensures accurate brightness measurement.
+1. **A metering frame is only trusted once both exposure *and* gain have landed.** `drain_to_exposure(exposure, gain)` discards frames until the metadata confirms both (5% tolerance each, floored at 2000 μs), and `meter_frame()` pairs pixels with metadata via `capture_request()` rather than calling `capture_array` and `capture_metadata` in sequence — those each block for a *fresh* frame, so the metadata would describe the frame after the one measured.
+
+   This is not a detail. Waiting on exposure alone produced the worst defect the rig has had: at night AEC settled on a value the controller then re-requested, so the drain returned on frame one with the *previous* gain still applied. Every correction reasoned about a scene the camera had moved on from, and 97.8% of LED captures ended in a `highlight_floor` that was pure artefact. Anything added to the control loop must settle the same way.
 
 2. **Exposure history stabilizes adjustments**: Recent exposures are median-blended and rate-limited (`_smooth_exposure`) to remove minute-to-minute flicker. Only exposures that respected the highlight budget enter the history — one blown frame would otherwise drag the median up for five captures. Smoothing is also re-measured and reverted if it makes clipping worse than the hunt achieved.
 
 3. **LED warm-up delay**: When LED is used, 0.5 second delay allows LED to reach full brightness before capture.
+
+   Both LED turn-on paths — the schedule and the hysteretic darkness override — go through `_aec_after_led_on()`, which seeds from `led_baseline_exposure` before re-running AEC. AEC's value at that instant was settled on a pitch-dark scene and overshoots badly under LED. The override branch used to skip the seed, which is why every LED turn-on in the 2026-08-01..03 data (all six) re-hunted from the dark value; one dusk capture landed at 129774 μs and 10.4% clipping.
 
 4. **Error handling**: The main loop continues on exceptions rather than crashing, ensuring continuous operation despite transient errors.
 
@@ -250,11 +254,16 @@ end_hour = 19
 # Optional auto-exposure settings (has defaults if omitted)
 [exposure.auto_exposure]
 target_brightness = 110
-min_exposure = 5000
-max_exposure = 10000000
+min_exposure = 3000
+max_exposure = 1000000
 tolerance = 20
-max_clip_pct = 2.0   # highlight budget: max % of pixels allowed at/above 250
+max_clip_pct = 2.0        # highlight budget: max % of pixels allowed at/above 250
+max_analogue_gain = 2.0   # gain above this is converted into exposure time instead
 ```
+
+`max_exposure` is bounded by the 60-second cadence, not by the sensor: every metering frame costs a full exposure, so a multi-second ceiling lets one hunt eat the capture interval. `drain_to_exposure` also enforces a wall-clock `max_wait_s` for the same reason.
+
+`max_analogue_gain` decides *how* the frame buys light. Gain is read noise; exposure time is free on a static subject, so excess gain is traded for integration time by `_cap_gain`. At the old 8.0 the AGC bought the entire night with gain (5.4x median) while exposure sat parked on the frame-duration ceiling at 66645 μs — the noisiest way to reach a given brightness. Raise it only if the scene starts moving or hunts get too slow.
 
 `max_clip_pct` must stay above what the scene can physically reach. Measured reference: 0.8% in daylight, 1.8% on an acceptable LED night frame, 4.1-4.7% on one with the centre destroyed. A budget below the reachable floor just darkens the whole frame; the controller detects that floor and stops (`highlight_floor`), but a sane budget avoids the situation.
 

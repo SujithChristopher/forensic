@@ -45,32 +45,46 @@ class FakeCamera:
     is_pi = True
 
     def __init__(self, field, gain=GAIN, aec_exposure=SCHEDULE_EXPOSURE, aec_gain=1.0,
-                 fail_after=None):
+                 fail_after=None, gain_lag=0):
         self.field = field
         self.gain = gain
         self.aec_exposure = aec_exposure
         self.aec_gain = aec_gain
         self.fail_after = fail_after  # metering frames to serve before returning None
         self.exposure = aec_exposure
+        # A gain change takes gain_lag frames to reach the sensor, so what is being
+        # delivered and what has been asked for can differ — as they did on the rig.
+        self.applied_gain = 1.0 if gain_lag else aec_gain
+        self.pending_gain = self.applied_gain
+        self.gain_lag = gain_lag        # frames a gain change takes to reach the sensor
+        self._gain_countdown = 0
         self.requested = []
+        self.settle_requests = []       # (exposure, gain) pairs the controller waited on
         self.frames_served = 0
 
-    def render(self, exposure):
-        return np.clip(self.field * self.gain * exposure, 0, 255).astype(np.uint8)
+    def render(self, exposure, gain=None):
+        gain = self.applied_gain if gain is None else gain
+        return np.clip(self.field * self.gain * exposure * gain, 0, 255).astype(np.uint8)
 
     def _frame(self):
+        """Serve one frame, letting any pending gain change age by a frame first."""
+        if self._gain_countdown > 0:
+            self._gain_countdown -= 1
+            if self._gain_countdown == 0:
+                self.applied_gain = self.pending_gain
         self.frames_served += 1
         if self.fail_after is not None and self.frames_served > self.fail_after:
             return None
         return self.render(self.exposure)
 
     def _meta(self):
-        return {'ExposureTime': self.exposure, 'AnalogueGain': self.aec_gain,
+        return {'ExposureTime': self.exposure, 'AnalogueGain': self.applied_gain,
                 'DigitalGain': 1.0, 'Lux': 12.5, 'SensorTemperature': 41.0,
                 'FrameDuration': 33000, 'ColourGains': (1.8, 1.6)}
 
     def meter_frame(self):
-        return self._frame(), self._meta()
+        frame = self._frame()
+        return frame, self._meta()
 
     def meter_brightness(self):
         return float(np.mean(self.render(self.exposure)))
@@ -79,26 +93,60 @@ class FakeCamera:
         if 'ExposureTime' in controls:
             self.exposure = controls['ExposureTime']
             self.requested.append(controls['ExposureTime'])
+        if 'AnalogueGain' in controls:
+            self.pending_gain = controls['AnalogueGain']
+            if self.gain_lag:
+                self._gain_countdown = self.gain_lag
+            else:
+                self.applied_gain = self.pending_gain
 
     def capture_metadata(self):
         return self._meta()
 
-    def drain_to_exposure(self, target_exposure, tolerance=None, max_frames=8):
+    def drain_to_exposure(self, target_exposure, target_gain=None, tolerance=None,
+                          max_frames=8, max_wait_s=10.0):
+        self.settle_requests.append((target_exposure, target_gain))
         self.exposure = target_exposure
-        return self._frame(), self._meta()
+        frame, meta = None, self._meta()
+        for _ in range(max_frames):
+            frame, meta = self.meter_frame()
+            if target_gain is None or abs(meta['AnalogueGain'] - target_gain) <= 0.05 * target_gain:
+                break
+        return frame, meta
 
-    def run_aec_settle(self):
+    def run_aec_settle(self, max_frames=20):
+        """Report the gain AEC has decided on — which the sensor may not be applying yet."""
         self.exposure = self.aec_exposure
+        self.pending_gain = self.aec_gain
+        if self.gain_lag:
+            self._gain_countdown = self.gain_lag
+        else:
+            self.applied_gain = self.aec_gain
         return self.aec_exposure, self.aec_gain
+
+
+class LEDFakeCamera(FakeCamera):
+    """A scene that is nearly pitch dark until the LED comes on."""
+
+    def __init__(self, *args, dark_factor=0.02, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.led_on_now = False
+        self.dark_factor = dark_factor
+
+    def render(self, exposure, gain=None):
+        gain = self.applied_gain if gain is None else gain
+        lit = 1.0 if self.led_on_now else self.dark_factor
+        return np.clip(self.field * self.gain * exposure * gain * lit, 0, 255).astype(np.uint8)
 
 
 class FakeConfig:
     auto_exposure_overrides = {
         'target_brightness': 110,
         'tolerance': 20,
-        'min_exposure': 5000,
-        'max_exposure': 10000000,
+        'min_exposure': 3000,
+        'max_exposure': 1000000,
         'max_clip_pct': 2.0,
+        'max_analogue_gain': 2.0,
     }
 
     def __init__(self, night=True):
@@ -126,22 +174,27 @@ class FakeStorage:
 class FakeLED:
     available = True
 
-    def __init__(self):
+    def __init__(self, camera=None):
         self.state = False
+        self.camera = camera
 
     def on(self):
         self.state = True
+        if self.camera is not None:
+            self.camera.led_on_now = True
         return True
 
     def off(self):
         self.state = False
+        if self.camera is not None:
+            self.camera.led_on_now = False
 
 
-def build(field=None, camera=None, use_led=False, **kwargs):
+def build(field=None, camera=None, use_led=False, night=True, **kwargs):
     camera = camera or FakeCamera(field if field is not None else uniform_field(), **kwargs)
     storage = FakeStorage()
-    controller = ExposureController(camera, FakeLED() if use_led else None,
-                                    FakeConfig(), storage, use_led=use_led)
+    controller = ExposureController(camera, FakeLED(camera) if use_led else None,
+                                    FakeConfig(night), storage, use_led=use_led)
     return controller, camera, storage
 
 
@@ -245,6 +298,82 @@ def test_smoothing_cannot_reintroduce_clipping():
     assert storage.exposure_rows[-1]['smoothing_reverted'] is True
     assert final == storage.exposure_rows[-1]['pre_smoothing_exposure']
     assert measure(camera, final)['clip_pct'] < measure(camera, SCHEDULE_EXPOSURE * 4)['clip_pct']
+
+
+# --------------------------------------------------------------- control settling
+def test_every_settle_waits_on_the_gain_it_asked_for():
+    """Regression: drain_to_exposure only ever checked ExposureTime.
+
+    Under LED the analogue gain is the dominant control (5x+) and lands a frame or two
+    after the exposure does. Waiting on exposure alone returned a frame shot at the
+    previous gain, so the whole hunt reasoned about a scene the camera had moved on from.
+    """
+    controller, camera, _ = build(hotspot_field())
+
+    controller.simple_adjust_exposure()
+
+    assert camera.settle_requests
+    assert all(gain is not None for _, gain in camera.settle_requests)
+
+
+def test_metering_is_not_fooled_by_a_gain_that_has_not_landed_yet():
+    """Regression: at night AEC already sat on the requested exposure, so the drain
+    returned on frame 1 with the old gain still applied. The correction pass then read a
+    *brighter* frame after *cutting* exposure and declared a highlight floor that was an
+    artefact — 97.8% of recorded LED captures ended that way."""
+    lagging = FakeCamera(uniform_field(), gain=GAIN / 1.6, aec_gain=1.6, gain_lag=3)
+    controller, camera, storage = build(camera=lagging)
+
+    row = controller.simple_adjust_exposure()
+    summary = storage.exposure_rows[-1]
+
+    # The summary must describe the frame the camera will actually deliver at the
+    # settings it settled on — not one taken while the gain was still ramping.
+    truth = calculate_image_quality(camera.render(row, camera.pending_gain))
+    assert summary['meter_brightness'] == pytest.approx(truth['avg_brightness'], rel=0.02)
+    # Metering at the stale 1.0x gain would have read the scene 1.6x too dark.
+    assert summary['meter_brightness'] > truth['avg_brightness'] / 1.5
+
+
+def test_darkness_override_seeds_from_the_led_baseline():
+    """Regression: the off->on guard was computed before the darkness-override branch
+    could set it, so every LED turn-on in three days of data (all six of them) re-hunted
+    AEC from the pitch-dark value. One dusk capture landed at 129774 μs / 10.4% clipped."""
+    dark = LEDFakeCamera(uniform_field(), aec_exposure=200000)
+    controller, camera, storage = build(camera=dark, use_led=True, night=False)
+
+    controller.simple_adjust_exposure()
+
+    row = storage.exposure_rows[-1]
+    assert row['darkness_override'] is True
+    assert row['led_just_turned_on'] is True
+    assert controller.led_baseline_exposure in camera.requested
+
+
+def test_excess_gain_is_spent_on_exposure_time_instead():
+    """Gain is read noise; on a static scene exposure time is free.
+
+    Recorded nights sat at 5.4x gain with exposure parked on the frame-duration ceiling,
+    which is the noisiest way to reach a given brightness.
+    """
+    controller, _, _ = build(uniform_field())
+
+    exposure, gain, capped = controller._cap_gain(100000, 6.0)
+
+    assert capped is True
+    assert gain == controller.max_analogue_gain
+    assert exposure == 300000  # 6.0x over a 2.0x cap buys 3x the integration time
+
+
+def test_gain_cap_reports_itself_in_the_summary_row():
+    controller, _, storage = build(uniform_field(), aec_exposure=100000, aec_gain=6.0)
+
+    controller.simple_adjust_exposure()
+
+    row = storage.exposure_rows[-1]
+    assert row['aec_gain'] == 6.0
+    assert row['gain_capped'] is True
+    assert row['analogue_gain'] == controller.max_analogue_gain
 
 
 # ------------------------------------------------------------------- diagnostics

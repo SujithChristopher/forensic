@@ -38,8 +38,21 @@ end_hour = 19    # 7 PM
 [exposure.auto_exposure]
 target_brightness = 110  # desired frame mean (0-255)
 tolerance = 20
-min_exposure = 5000
-max_exposure = 10000000
+
+# Exposure bounds, microseconds. The floor is the sensor's, not a guess: the trace CSVs
+# show frames delivered at 3023 μs, while a 5000 μs floor left hours 10-11 pinned at the
+# limit, 25 points over target and 6.8% clipped. The ceiling is set by the 60s capture
+# cadence rather than the sensor — every metering frame costs a full exposure, so a 10s
+# ceiling can eat the interval during a hunt.
+min_exposure = 3000
+max_exposure = 1000000
+
+# Analogue gain ceiling. Gain above this is converted into exposure time instead, so the
+# frame gets its light from a longer integration rather than from amplified read noise.
+# The subject is static, so long exposures cost nothing. At 8.0 the AGC bought the entire
+# night with gain (5.4x median) and left exposure parked at the 66645 μs frame-duration
+# ceiling. Raise it only if the scene starts moving or the hunt gets too slow.
+max_analogue_gain = 2.0
 
 # Highlight budget: max % of pixels allowed at/above 250. The LED is an on-axis point
 # source, so at night the frame centre runs ~2.8x the mean and a mean on target can

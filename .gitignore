@@ -8,3 +8,8 @@ build
 code_red.py
 secrets.toml
 .env
+.python-version
+pyprojects.toml
+READEME.md
+uv.lock
+README.md

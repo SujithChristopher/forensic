@@ -9,6 +9,7 @@ full-resolution buffers; only capture_and_save() touches the main stream.
 """
 
 import platform
+import time
 
 import cv2
 import numpy as np
@@ -35,6 +36,10 @@ def summarize_metadata(meta):
 
 
 class Camera:
+    # AnalogueGain lands a frame or two after ExposureTime, and under LED it is the
+    # dominant control (5x+), so a settle check that ignores it measures the wrong scene.
+    GAIN_TOLERANCE = 0.05
+
     def __init__(self, frame_size, meter_size, initial_exposure):
         self.frame_size = frame_size
         self.meter_size = meter_size
@@ -98,6 +103,16 @@ class Camera:
         return max(2000, int(0.05 * abs(target_exposure)))
 
     # -------------------------------------------------------------- metering
+    def _extract_luma(self, arr, stream):
+        if stream == "main":
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        w, h = self.meter_size
+        if arr.ndim == 3:
+            # Some pipelines hand back an RGB lores buffer instead of YUV420.
+            return cv2.cvtColor(arr[:h, :w], cv2.COLOR_RGB2GRAY)
+        # YUV420: the first h rows are the luma (brightness) plane.
+        return arr[:h, :w]
+
     def meter_gray(self):
         """Capture a low-resolution grayscale frame for brightness metering.
 
@@ -107,22 +122,31 @@ class Camera:
         """
         if self.has_lores:
             try:
-                arr = self.picam2.capture_array("lores")
-                w, h = self.meter_size
-                if arr.ndim == 3:
-                    # Some pipelines hand back an RGB lores buffer instead of YUV420.
-                    return cv2.cvtColor(arr[:h, :w], cv2.COLOR_RGB2GRAY)
-                # YUV420: the first h rows are the luma (brightness) plane.
-                return arr[:h, :w]
+                return self._extract_luma(self.picam2.capture_array("lores"), "lores")
             except Exception as e:
                 print(f"lores metering failed ({e}); falling back to main stream")
-        frame = self.picam2.capture_array("main")
-        return cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        return self._extract_luma(self.picam2.capture_array("main"), "main")
 
     def meter_frame(self):
-        """Return (grayscale metering frame, metadata) for the current scene."""
-        gray = self.meter_gray()
-        return gray, self.picam2.capture_metadata()
+        """Return (grayscale metering frame, metadata) for one and the same frame.
+
+        capture_array() and capture_metadata() each block for a *fresh* frame, so
+        calling them in sequence returns pixels and metadata from two different
+        frames — the metadata describes the frame after the one that was measured.
+        Every exposure/gain decision made from such a pair is one frame stale.
+        capture_request() hands back both halves of a single frame.
+        """
+        stream = "lores" if self.has_lores else "main"
+        try:
+            request = self.picam2.capture_request()
+            try:
+                return (self._extract_luma(request.make_array(stream), stream),
+                        request.get_metadata())
+            finally:
+                request.release()
+        except Exception as e:
+            print(f"metering capture_request failed ({e}); falling back to unpaired capture")
+            return self.meter_gray(), self.picam2.capture_metadata()
 
     def meter_brightness(self):
         """Mean brightness of the current scene from a lores metering frame."""
@@ -132,44 +156,71 @@ class Camera:
             print(f"Error measuring brightness: {e}")
             return None
 
-    def drain_to_exposure(self, target_exposure, tolerance=None, max_frames=8):
+    def _gain_settled(self, meta, target_gain):
+        if target_gain is None:
+            return True
+        actual = meta.get('AnalogueGain')
+        if actual is None:
+            return True
+        return abs(actual - target_gain) <= self.GAIN_TOLERANCE * max(target_gain, 1e-6)
+
+    def drain_to_exposure(self, target_exposure, target_gain=None, tolerance=None,
+                          max_frames=8, max_wait_s=10.0):
         """
-        Discard frames until capture_metadata confirms the pipeline is delivering
-        the requested ExposureTime. Returns the last measured grayscale frame and its
-        metadata. picamera2 applies set_controls() to a future frame, not the current
-        one, so reading metadata is the only reliable way to know when the setting landed.
-        Metering frames come from the lores stream to keep the hunt cheap.
+        Discard frames until the metadata confirms the pipeline is delivering the
+        requested ExposureTime *and* AnalogueGain. Returns the last measured grayscale
+        frame and the metadata of that same frame.
+
+        picamera2 applies set_controls() to a future frame, so metadata is the only
+        reliable signal that a setting has landed. Both controls must be checked:
+        exposure often matches on the first frame (AEC may already be sitting on the
+        requested value) while the gain is still ramping, and metering that frame reports
+        a scene the camera is no longer capturing.
+
+        max_wait_s bounds the drain in wall-clock time, since a multi-second exposure
+        makes each frame cost that much and the whole hunt has to fit in the 60s cadence.
         """
         if tolerance is None:
             tolerance = self.relative_tolerance(target_exposure)
+        deadline = time.monotonic() + max_wait_s
         frame = None
         meta = {}
         for i in range(max_frames):
-            frame = self.meter_gray()
-            meta = self.picam2.capture_metadata()
+            frame, meta = self.meter_frame()
             actual = meta.get('ExposureTime', 0)
-            if abs(actual - target_exposure) <= tolerance:
-                print(f"Exposure settled after {i+1} frame(s): "
-                      f"requested={target_exposure} μs, actual={actual} μs")
+            if (abs(actual - target_exposure) <= tolerance
+                    and self._gain_settled(meta, target_gain)):
+                print(f"Settled after {i+1} frame(s): exposure {actual} μs "
+                      f"(requested {target_exposure}), gain {meta.get('AnalogueGain')} "
+                      f"(requested {target_gain})")
+                break
+            if time.monotonic() >= deadline:
+                print(f"Settle wait exceeded {max_wait_s:.0f}s after {i+1} frame(s)")
                 break
         else:
-            print(f"Exposure did not settle within {max_frames} frames "
-                  f"(last actual={meta.get('ExposureTime')} μs, target={target_exposure} μs)")
+            print(f"Did not settle within {max_frames} frames "
+                  f"(exposure {meta.get('ExposureTime')} μs vs {target_exposure}, "
+                  f"gain {meta.get('AnalogueGain')} vs {target_gain})")
         return frame, meta
 
-    def run_aec_settle(self):
-        """Enable AEC and drain frames until ExposureTime stabilises across two reads."""
+    def run_aec_settle(self, max_frames=20):
+        """Enable AEC/AGC and drain frames until exposure *and* gain stop moving.
+
+        Waiting on exposure alone returns while the gain is still climbing, and the
+        gain reported at that moment is not the one the next frames will be shot at.
+        """
         self.picam2.set_controls({'AeEnable': True})
-        prev_exposure = 0
-        meta = {}
-        for _ in range(20):
-            self.meter_gray()
-            meta = self.picam2.capture_metadata()
-            curr = meta.get('ExposureTime', 0)
-            if abs(curr - prev_exposure) < self.relative_tolerance(curr):
+        prev_exposure, prev_gain = 0, 0.0
+        exposure, gain = 0, 1.0
+        for _ in range(max_frames):
+            _, meta = self.meter_frame()
+            exposure = meta.get('ExposureTime', 0)
+            gain = meta.get('AnalogueGain', 1.0)
+            if (abs(exposure - prev_exposure) < self.relative_tolerance(exposure)
+                    and abs(gain - prev_gain) <= self.GAIN_TOLERANCE * max(gain, 1e-6)):
                 break
-            prev_exposure = curr
-        return meta.get('ExposureTime', prev_exposure), meta.get('AnalogueGain', 1.0)
+            prev_exposure, prev_gain = exposure, gain
+        return exposure, gain
 
     # --------------------------------------------------------------- capture
     def capture_and_save(self, image_path):

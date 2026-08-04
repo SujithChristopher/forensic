@@ -63,15 +63,23 @@ class ExposureController:
         self.min_clip_improvement = 0.10
 
         # --- exposure bounds (microseconds) ---
-        self.min_exposure = 5000
-        self.max_exposure = 10000000
+        # min: measured — the sensor delivered 3023 μs, and hours 10-11 were pinned at a
+        # 5000 μs floor with the frame still 25 points over target and 6.8% clipped.
+        # max: bounded by the 60s cadence, not by the sensor. Each metering frame costs a
+        # whole exposure, so a 10s ceiling could eat the interval; 1s at the gain cap
+        # below is ~5x more light than the brightest LED night frame needed.
+        self.min_exposure = 3000
+        self.max_exposure = 1000000
 
         # Kept for parity with the original tuning surface (not used in the AEC path)
         self.max_exposure_attempts = 5
         self.aec_settle_time = 2.0
 
-        # Maximum analogue gain — caps noise in dark/evening conditions
-        self.max_analogue_gain = 8.0
+        # Maximum analogue gain — caps noise in dark/evening conditions. Excess gain is
+        # traded for exposure time by _cap_gain. At 8.0 the AGC bought the whole night
+        # with gain (5.4x median) and left exposure parked at the frame-duration ceiling;
+        # the subject is static, so time is the cheaper currency.
+        self.max_analogue_gain = 2.0
 
         # LED darkness override with hysteresis to avoid dusk/dawn oscillation:
         # turn the LED on when ambient (LED-off) brightness drops below led_on_threshold,
@@ -115,6 +123,8 @@ class ExposureController:
                 self.brightness_tolerance = overrides["tolerance"]
             if "max_clip_pct" in overrides:
                 self.max_clip_pct = overrides["max_clip_pct"]
+            if "max_analogue_gain" in overrides:
+                self.max_analogue_gain = overrides["max_analogue_gain"]
 
     # ------------------------------------------------------------- delegation
     def get_current_exposure_time(self):
@@ -173,6 +183,45 @@ class ExposureController:
         if self._is_highlight_limited(clip_pct):
             return None
         return min(self.target_brightness / max(1.0, brightness), 2.0)
+
+    # ------------------------------------------------------- AEC helpers
+    def _cap_gain(self, exposure_time, gain):
+        """Trade analogue gain above the cap for exposure time, then clamp to bounds.
+
+        Returns (exposure_time, gain, capped). Gain is read noise; exposure is free on a
+        static scene, so buy light with time wherever the frame rate allows it.
+        """
+        capped = gain > self.max_analogue_gain
+        if capped:
+            exposure_time = min(int(exposure_time * (gain / self.max_analogue_gain)),
+                                self.max_exposure)
+            gain = self.max_analogue_gain
+            print(f"Gain capped at {self.max_analogue_gain:.1f}x -> "
+                  f"exposure adjusted to {exposure_time} μs")
+        exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
+        return exposure_time, gain, capped
+
+    def _aec_after_led_on(self):
+        """Re-settle AEC from the LED baseline, just after the LED has come on.
+
+        AEC's current value was settled on a pitch-dark scene and would overshoot
+        massively now the LED is lit. Seed from a known-good baseline and let AEC hunt
+        down from there instead of climbing from the dark value.
+
+        Both LED turn-on paths (the schedule and the darkness override) come through
+        here — the override used to skip the baseline and re-hunt straight from the dark
+        AEC value, which is how a dusk capture reached 129774 μs at 10.4% clipping.
+        """
+        print(f"LED off->on transition: seeding AEC from baseline "
+              f"{self.led_baseline_exposure} μs (skipping the dark AEC value)")
+        self.camera.set_controls({'AeEnable': False,
+                                  'ExposureTime': self.led_baseline_exposure,
+                                  'AnalogueGain': 1.0})
+        # Wait for the seed to reach the sensor before handing control back to AEC.
+        # Re-enabling AEC in the very next call leaves it hunting from the dark value it
+        # already had, which is the whole thing this guard exists to prevent.
+        self.camera.drain_to_exposure(self.led_baseline_exposure, 1.0)
+        return self.camera.run_aec_settle()
 
     def _observe(self, stage, requested, frame, meta, pass_num=0, led_on=False):
         """Score a metering frame and append it to this capture's decision trace."""
@@ -262,35 +311,15 @@ class ExposureController:
 
                 # --- Step 1: AEC settle (with LED state-change guard) ---
                 if led_just_turned_on:
-                    # AEC's value from the dark period would cause massive overshoot.
-                    # Jump straight to the known-good LED baseline and let AEC re-hunt.
-                    exposure_time = self.led_baseline_exposure
-                    gain = 1.0
-                    print(f"LED off->on transition: seeding from baseline {exposure_time} μs "
-                          f"(skipping dark AEC value)")
-                    self.camera.set_controls({
-                        'AeEnable': False,
-                        'ExposureTime': exposure_time,
-                        'AnalogueGain': gain,
-                    })
+                    exposure_time, gain = self._aec_after_led_on()
                 else:
                     exposure_time, gain = self.camera.run_aec_settle()
-                    print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
+                print(f"AEC settled: exposure={exposure_time} μs, gain={gain:.2f}")
 
                 state['aec_exposure'], state['aec_gain'] = exposure_time, gain
 
                 # --- Step 2: cap analogue gain to limit noise ---
-                if gain > self.max_analogue_gain:
-                    exposure_time = min(
-                        int(exposure_time * (gain / self.max_analogue_gain)),
-                        self.max_exposure,
-                    )
-                    gain = self.max_analogue_gain
-                    state['gain_capped'] = True
-                    print(f"Gain capped at {self.max_analogue_gain:.1f}x -> "
-                          f"exposure adjusted to {exposure_time} μs")
-
-                exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
+                exposure_time, gain, state['gain_capped'] = self._cap_gain(exposure_time, gain)
 
                 # --- Step 3: lock and verify initial brightness ---
                 self.camera.set_controls({
@@ -298,7 +327,7 @@ class ExposureController:
                     'ExposureTime': exposure_time,
                     'AnalogueGain': gain,
                 })
-                frame, verify_meta = self.camera.drain_to_exposure(exposure_time)
+                frame, verify_meta = self.camera.drain_to_exposure(exposure_time, gain)
                 metrics = self._observe('verify', exposure_time, frame, verify_meta,
                                         led_on=led_used)
                 if frame is None:
@@ -326,21 +355,17 @@ class ExposureController:
                     led_used = self.led_on()
                     if led_used:
                         time.sleep(0.5)
-                        # Start AEC from the current (dark) exposure clamped to baseline
-                        # so it doesn't have to climb from a high value
-                        seed = min(exposure_time, self.led_baseline_exposure)
-                        self.camera.set_controls({'AeEnable': False, 'ExposureTime': seed})
-                        exposure_time, gain = self.camera.run_aec_settle()
-                        if gain > self.max_analogue_gain:
-                            exposure_time = min(
-                                int(exposure_time * (gain / self.max_analogue_gain)),
-                                self.max_exposure)
-                            gain = self.max_analogue_gain
-                        exposure_time = max(self.min_exposure, min(self.max_exposure, exposure_time))
+                        # The LED has just come on here too, so this path needs the same
+                        # baseline seeding as the scheduled one — and the flag, which used
+                        # to be computed before this branch could ever set it.
+                        state['led_just_turned_on'] = True
+                        exposure_time, gain = self._aec_after_led_on()
+                        exposure_time, gain, capped = self._cap_gain(exposure_time, gain)
+                        state['gain_capped'] = state['gain_capped'] or capped
                         self.camera.set_controls({'AeEnable': False,
                                                   'ExposureTime': exposure_time,
                                                   'AnalogueGain': gain})
-                        frame, override_meta = self.camera.drain_to_exposure(exposure_time)
+                        frame, override_meta = self.camera.drain_to_exposure(exposure_time, gain)
                         override_metrics = self._observe(
                             'override_aec', exposure_time, frame, override_meta, led_on=True)
                         if frame is not None:
@@ -376,7 +401,7 @@ class ExposureController:
                     self.camera.set_controls({'ExposureTime': new_exposure})
                     exposure_time = new_exposure
                     state['passes_used'] = pass_num + 1
-                    check_frame, check_meta = self.camera.drain_to_exposure(new_exposure)
+                    check_frame, check_meta = self.camera.drain_to_exposure(new_exposure, gain)
                     check_metrics = self._observe('correction', new_exposure, check_frame,
                                                   check_meta, pass_num=pass_num + 1,
                                                   led_on=led_used)
@@ -402,7 +427,7 @@ class ExposureController:
                         brightness = metrics['avg_brightness']
                         contrast = metrics['contrast_ratio']
                         self.camera.set_controls({'ExposureTime': exposure_time})
-                        self.camera.drain_to_exposure(exposure_time)
+                        self.camera.drain_to_exposure(exposure_time, gain)
                         state['outcome'] = "highlight_floor"
                         break
 
@@ -430,7 +455,7 @@ class ExposureController:
                     pre_smoothing_exposure = exposure_time
                     pre_smoothing_metrics = metrics
                     self.camera.set_controls({'ExposureTime': smoothed})
-                    check_frame, smooth_meta = self.camera.drain_to_exposure(smoothed)
+                    check_frame, smooth_meta = self.camera.drain_to_exposure(smoothed, gain)
                     smooth_metrics = self._observe('smoothing', smoothed, check_frame,
                                                    smooth_meta, led_on=led_used)
                     exposure_time = smoothed
@@ -455,7 +480,7 @@ class ExposureController:
                             brightness = metrics['avg_brightness']
                             contrast = metrics['contrast_ratio']
                             self.camera.set_controls({'ExposureTime': exposure_time})
-                            self.camera.drain_to_exposure(exposure_time)
+                            self.camera.drain_to_exposure(exposure_time, gain)
 
             else:
                 exposure_time = base_exposure
